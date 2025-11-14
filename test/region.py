@@ -1,12 +1,12 @@
 import numpy as np
-import exodusii
+import exovista
 
 
 def test_region_cylinder_2d_0():
     p1 = [0.0, 0.0]
     p2 = [1.0, 0.0]
     radius = 0.5
-    region = exodusii.region.cylinder(p1, p2, radius)
+    region = exovista.region.cylinder(p1, p2, radius)
     a = [0, -radius]
     b = [1, -radius]
     c = [1, radius]
@@ -31,7 +31,7 @@ def test_region_cylinder_2d_1():
     p1 = [0.0, 0.0]
     p2 = [1.0, 1.0]
     radius = 0.5
-    region = exodusii.region.cylinder(p1, p2, radius)
+    region = exovista.region.cylinder(p1, p2, radius)
     x = 0.5 * np.sqrt(2) / 2
     a = [0.99 * x, -0.99 * x]
     b = [1 + 0.99 * x, 1 - 0.99 * x]
@@ -57,7 +57,7 @@ def test_region_cylinder_3d():
     p1 = [0.0, 0.0, 0.0]
     p2 = [1.0, 0.0, 0.0]
     radius = 0.5
-    region = exodusii.region.cylinder(p1, p2, radius)
+    region = exovista.region.cylinder(p1, p2, radius)
     points = [[0, 0.5, 0], [0, 1.5, 0]]
     assert region.contains(points[0])
     assert not region.contains(points[1])
@@ -68,7 +68,7 @@ def test_region_cylinder_3d():
 
 def test_region_rectangle():
     origin = [0.0, -2.5]
-    region = exodusii.region.rectangle(origin, 5.0, 5.0)
+    region = exovista.region.rectangle(origin, 5.0, 5.0)
     points = [[0, 2.5], [-3.0, 2.5]]
     assert region.contains(points[0])
     assert not region.contains(points[1])
@@ -78,7 +78,7 @@ def test_region_rectangle():
 
 
 def test_region_quad():
-    region = exodusii.region.quad([1.0, 1.0], [5.0, 2.0], [6.0, 5.0], [0.0, 3.0])
+    region = exovista.region.quad([1.0, 1.0], [5.0, 2.0], [6.0, 5.0], [0.0, 3.0])
     points = [[2, 2.5], [4.0, 0.0]]
     assert region.contains(points[0])
     assert not region.contains(points[1])
@@ -88,7 +88,7 @@ def test_region_quad():
 
 
 def test_region_circle():
-    region = exodusii.region.circle([0.0, 0.0], 1.0)
+    region = exovista.region.circle([0.0, 0.0], 1.0)
     points = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [-1.0, 0], [0.0, -1.0], [0, 1.1]]
     for point in points[:-1]:
         assert region.contains(point)
@@ -99,7 +99,7 @@ def test_region_circle():
 
 
 def test_region_sphere():
-    region = exodusii.region.sphere([0.0, 0.0, 0.0], 1.0)
+    region = exovista.region.sphere([0.0, 0.0, 0.0], 1.0)
     points = [
         [0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],

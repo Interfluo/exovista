@@ -59,8 +59,8 @@ class exodusii_file:
     To create a ExodusII file:
 
     >>> import sys
-    >>> import exodusii
-    >>> f = exodusii.exodusii_file('file.exo', 'r')
+    >>> import exovista
+    >>> f = exovista.exodusii_file('file.exo', 'r')
     >>> f.describe(file=sys.stdout)
     ...
 
@@ -375,7 +375,7 @@ class exodusii_file:
 
         Examples
         --------
-        >>> f = exodusii.exodusii_file()
+        >>> f = exovista.exodusii_file()
         sxx = f.get
 
         """

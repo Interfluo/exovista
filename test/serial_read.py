@@ -2,13 +2,13 @@
 
 import os
 import numpy as np
-import exodusii
+import exovista
 
 
 def test_exodusii_read_0(datadir):
 
     noh = os.path.join(datadir, "noh.exo")
-    exof = exodusii.File(noh)
+    exof = exovista.File(noh)
     assert exof.filename == noh
     assert exof.title() == "PAMGEN Inline Mesh"
     exof.close()
@@ -17,7 +17,7 @@ def test_exodusii_read_0(datadir):
 def test_exodusii_read_1(datadir):
 
     noh = os.path.join(datadir, "noh.exo")
-    exof = exodusii.File(noh)
+    exof = exovista.File(noh)
     assert exof.num_dimensions() == 2
     assert exof.storage_type() == "d"
 
@@ -523,7 +523,7 @@ def test_exodusii_read_1(datadir):
 def test_exodusii_read_mkmesh(datadir):
     # use mkmesh files to test reading distribution factors
 
-    exof = exodusii.File(os.path.join(datadir, "mkmesh.gen"))
+    exof = exovista.File(os.path.join(datadir, "mkmesh.gen"))
     assert exof.num_dimensions() == 2
     assert exof.storage_type() == "d"
 
@@ -553,6 +553,6 @@ def test_exodusii_read_mkmesh(datadir):
 
 def test_exodusii_allclose(datadir):
     noh = os.path.join(datadir, "noh.exo")
-    f1 = exodusii.exo_file(noh)
-    f2 = exodusii.exo_file(noh)
-    assert exodusii.allclose(f1, f2)
+    f1 = exovista.exo_file(noh)
+    f2 = exovista.exo_file(noh)
+    assert exovista.allclose(f1, f2)

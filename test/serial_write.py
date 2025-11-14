@@ -1,18 +1,18 @@
 import os
 import numpy as np
 
-import exodusii
-import exodusii.util as util
+import exovista
+import exovista.util as util
 
 
 def test_exodusii_write_1(tmpdir):
     # this test sets some initialization values then reads back those values
     with util.working_dir(tmpdir.strpath):
         f = "baz.exo"
-        with exodusii.File(f, mode="w") as exof:
+        with exovista.File(f, mode="w") as exof:
             exof.put_init(f"Test {f}", 2, 1, 2, 3, 4, 5)
 
-        with exodusii.File(f, mode="r") as exof:
+        with exovista.File(f, mode="r") as exof:
             assert exof.title() == f"Test {f}", exof.title()
             assert exof.num_dimensions() == 2
             assert exof.num_nodes() == 1
@@ -30,8 +30,8 @@ def test_exodusii_write_2(tmpdir):
         spam = np.linspace(20, 30, 25)
         data = {"baz": baz, "foo": foo, "spam": spam}
         times = np.linspace(0, 100, 25)
-        f = exodusii.write_globals(data, times, "Test")
-        with exodusii.File(f, mode="r") as exof:
+        f = exovista.write_globals(data, times, "Test")
+        with exovista.File(f, mode="r") as exof:
             assert exof.title() == "Test"
             assert exof.num_dimensions() == 1
             assert exof.num_nodes() == 0
@@ -68,7 +68,7 @@ def test_exodusii_write_3(tmpdir):
     sideset_cells = [[0], [0, 0]]
     sideset_sides = [[1], [2, 3]]
     with util.working_dir(tmpdir.strpath):
-        with exodusii.File('write_3.exo', mode="w") as exof: 
+        with exovista.File('write_3.exo', mode="w") as exof:
             exof.put_init('Write_3', ndim, node_count, cell_count,
                           len(block_names), 0, len(sideset_names))
             exof.put_coord(x, y)
@@ -83,7 +83,7 @@ def test_exodusii_write_3(tmpdir):
             exof.put_side_set_param(2, len(sideset_cells[1]))
             exof.put_side_set_name(2, sideset_names[1])
             exof.put_side_set_sides(2, sideset_cells[1], sideset_sides[1])
-        with exodusii.File('write_3.exo', mode="r") as exof:
+        with exovista.File('write_3.exo', mode="r") as exof:
             assert exof.title() == "Write_3"
             assert exof.num_dimensions() == 2
             assert exof.num_nodes() == 4
@@ -115,7 +115,7 @@ def test_exodusii_write_4(tmpdir):
     y = np.array([0.0, 0.0, 1.0, 1.0])
     block_names = ['block1', 'block2', 'block3']
     with util.working_dir(tmpdir.strpath):
-        with exodusii.File('write_4.exo', mode="w") as exof: 
+        with exovista.File('write_4.exo', mode="w") as exof:
             exof.put_init('Write_4', ndim, node_count, cell_count,
                           len(block_names), 0, 0)
             exof.put_coord(x, y)
@@ -123,7 +123,7 @@ def test_exodusii_write_4(tmpdir):
             exof.put_element_block(2, type, cell_count, node_count)
             exof.put_element_block(3, type, cell_count, node_count)
             exof.put_element_block_names(block_names)
-        with exodusii.File('write_4.exo', mode="r") as exof:
+        with exovista.File('write_4.exo', mode="r") as exof:
             assert exof.title() == "Write_4"
             assert exof.num_dimensions() == 2
             assert exof.num_nodes() == 4

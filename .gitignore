@@ -8,3 +8,4 @@ htmlcov
 # Ignore personal settings
 .vscode
 .vscode/settings.json
+/exovista.egg-info
