@@ -6,7 +6,7 @@ from .extension import *  # noqa: F403
 from .lineout import lineout
 from .find_in_region import find_element_data_in_region, find_node_data_in_region
 from .exoread import main as exoread
-
+from .write_pyvista import write_exo
 
 def File(filename, *files, mode="r"):
 

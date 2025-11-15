@@ -2,7 +2,7 @@
 name = "exovista"
 version = "1.0.0"
 description = "Python wrappers to the ExodusII finite element database model"
-dependencies = ["netcdf4"]
+dependencies = ["netcdf4", "pyvista", "numpy", "scipy"]
 
 [project.scripts]
 "exoread.py" = "exodusii:exoread"
