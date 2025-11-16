@@ -61,9 +61,15 @@ def export_hex_mesh():
 </div>
 
 ## Install
-
+install from pypi
+```shell
+pip install exovista
 ```
-python -m pip install .
+install editable version
+```shell
+git clone https://github.com/Interfluo/exovista.git
+cd exovista
+pip install -e .
 ```
 
 ## Copyright
