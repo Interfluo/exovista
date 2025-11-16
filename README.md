@@ -22,15 +22,14 @@ After centering the mesh, extract the surface and assign cell-wise region arrays
 def export_tetra_mesh():
     volume = pv.examples.download_letter_a()
     volume.points -= volume.center
-    surface = volume.extract_surface()
-
-    volume["region"] = 1 * (volume.cell_centers().points[:, 0] > 0)
+    volume["tag"] = 1 * (volume.cell_centers().points[:, 0] > 0)
     volume.plot(show_edges=True, categories=True, parallel_projection=True, text="element blocks")
-    
-    surface["region"] = 1 * (surface.cell_centers().points[:, 2] > 0)
+
+    surface = volume.extract_surface()
+    surface["tag"] = 1 * (surface.cell_centers().points[:, 2] > 0)
     surface.plot(show_edges=True, categories=True, parallel_projection=True, text="side sets")
 
-    exovista.write_exo("test.exo", volume, surface)
+    exovista.write_exo("tetra.exo", volume, surface, "tag")
     return None
 ```
 <div style="display: flex; gap: 10px;">
@@ -48,10 +47,12 @@ def export_hex_mesh():
     volume["region"] = 1*(volume.cell_centers().points[:, 1] > 0) + 2*(volume.cell_centers().points[:, 2] > 0)
     volume.plot(show_edges=True, categories=True, parallel_projection=True, text="element blocks")
 
+
     surface["region"] = 1*(surface.cell_centers().points[:, 0] > 0)
     surface.plot(show_edges=True, categories=True, parallel_projection=True, text="side sets")
 
-    exovista.write_exo("test.exo", volume, surface)
+    exovista.write_exo("hex.exo", volume, surface)
+    exovista.write_exo("hex_no_sides.exo", volume, None)
     return None
 ```
 <div style="display: flex; gap: 10px;">
