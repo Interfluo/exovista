@@ -33,6 +33,7 @@ def export_hex_mesh():
     surface.plot(show_edges=True, categories=True, parallel_projection=True, text="side sets")
 
     exovista.write_exo("hex.exo", volume, surface)
+    exovista.write_exo("hex_no_sides.exo", volume, None)
     return None
 
 

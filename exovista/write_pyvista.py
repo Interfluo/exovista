@@ -75,7 +75,7 @@ def get_face_center_info(mesh: pv.UnstructuredGrid, cell_ids: list[int], block_i
     return points
 
 
-def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key: str = "region") -> tuple[dict, pv.MultiBlock]:
+def _process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key: str = "region") -> tuple[dict, pv.MultiBlock]:
     """
     Process volume and surface meshes to prepare for ExodusII export.
 
@@ -140,7 +140,82 @@ def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key
     return volume_blocks, surface.split_values(scalars=region_key)
 
 
-def write_exo(filename, volume, surface, region_key: str = "region"):
+def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key: str = "region") -> tuple[dict, pv.MultiBlock]:
+    """
+    Process volume and surface meshes to prepare for ExodusII export.
+
+    Splits the volume mesh into blocks by cell type and region. Maps surface faces
+    to corresponding volume faces using nearest-neighbor interpolation.
+
+    Parameters
+    ----------
+    volume : pv.UnstructuredGrid
+        The volume mesh.
+    surface : pv.PolyData
+        The surface mesh.
+    region_key : str, optional
+        The name of the cell data array defining regions (default is "region").
+
+    Returns
+    -------
+    tuple[dict, pv.MultiBlock]
+        Dictionary of volume blocks and MultiBlock of surface side sets.
+    """
+    # Check and fallback for volume regions
+    if region_key not in volume.cell_data:
+        logging.warning(f"Region key '{region_key}' not found in volume cell data. Setting all regions to 1.")
+        volume.cell_data[region_key] = np.ones(volume.n_cells, dtype=int)
+
+    volume_regions = np.unique(volume[region_key])
+    logging.info(f"Volume regions found: {volume_regions}")
+
+    if surface is not None:
+        # Check and fallback for surface regions
+        if region_key not in surface.cell_data:
+            logging.warning(f"Region key '{region_key}' not found in surface cell data. Setting all regions to 1.")
+            surface.cell_data[region_key] = np.ones(surface.n_cells, dtype=int)
+
+        surface_regions = np.unique(surface[region_key])
+        logging.info(f"Surface regions found: {surface_regions}")
+    else:
+        surface_regions = []
+        logging.info("No surface provided. Skipping surface processing.")
+
+    # Split volume blocks by cell_type and region
+    volume_blocks = {}
+    cell_id, counter = 0, 0
+    for cell_type in pv.CellType:
+        volume_cell_type = volume.extract_cells_by_type(cell_type)
+        if volume_cell_type.n_cells > 0:
+            logging.info(f"Processing cell type: {cell_type.name} with {volume_cell_type.n_cells} cells")
+            for m in volume_cell_type.split_values(scalars=region_key):
+                region_value = m[region_key][0] if region_key in m.cell_data else 1
+                logging.info(f"  - Sub-block with region {region_value} and {m.n_cells} cells")
+                volume_blocks[counter] = {"region": region_value, "cell_type": cell_type, "mesh": m, "cell_ids": [i+cell_id for i in range(m.n_cells)]}
+                cell_id += m.n_cells
+                counter += 1
+
+    if not volume_blocks:
+        logging.warning("No volume blocks found after processing. Export may fail.")
+
+    if surface is not None:
+        # Compute face centers for interpolation
+        face_points = pv.MultiBlock([get_face_center_info(item["mesh"], item["cell_ids"], item["region"]) for key, item in volume_blocks.items()]).combine()
+        logging.info(f"Generated {face_points.n_points} face center points for interpolation.")
+
+        # Map surface to volume faces
+        for s in ["block_ids", "cell_ids", "face_ids"]:
+            surface[s] = NearestNDInterpolator(face_points.points, face_points[s])(surface.cell_centers().points)
+        logging.info("Surface face mapping completed.")
+
+        surfaces = surface.split_values(scalars=region_key)
+    else:
+        surfaces = pv.MultiBlock()
+
+    return volume_blocks, surfaces
+
+
+def write_exo(filename, volume: pv.UnstructuredGrid, surface: pv.PolyData = None, region_key: str = "region"):
     """
     Write PyVista volume and surface meshes to an ExodusII file.
 
@@ -229,5 +304,4 @@ def write_exo(filename, volume, surface, region_key: str = "region"):
         logging.info(f"{filename} saved successfully.")
 
     return None
-
 
