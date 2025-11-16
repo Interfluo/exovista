@@ -1,6 +1,6 @@
 [project]
 name = "exovista"
-version = "1.0.3"
+version = "1.0.4"
 description = "Python wrappers to the ExodusII finite element database model"
 dependencies = ["netcdf4", "pyvista", "numpy", "scipy"]
 
