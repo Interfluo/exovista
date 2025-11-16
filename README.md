@@ -2,6 +2,8 @@
 
 An extension of the Sandia exodusii library for exporting PyVista meshes to Exodus format with user-defined element blocks and side sets. This project focuses on a simpler interface for PyVista users (e.g., meshes created via meshio or PyVista’s geometric utilities).
 
+Note that this code was initially a fork of: https://github.com/sandialabs/exodusii
+
 # Why ExoVista?
 
 While PyVista can read and write Exodus files via meshio, this support is limited. For example, in the SIERRA toolset, element blocks are essential for defining material zones, and side sets are commonly used to assign boundary conditions. Currently, meshio cannot save side sets or user-defined element blocks.
