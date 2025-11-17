@@ -36,7 +36,19 @@ def export_hex_mesh():
     exovista.write_exo("hex_no_sides.exo", volume, None)
     return None
 
+def export_hybrid():
+    volume = pv.MultiBlock([
+        pv.examples.download_letter_a(),
+        pv.CylinderStructured(radius=np.linspace(1, 2, 5)).cast_to_unstructured_grid()
+    ]).combine()
+    surface = volume.extract_surface()
+
+    exovista.write_exo("hybrid.exo", volume, surface)
+
+    return None
+
 
 if __name__ == '__main__':
-    export_tetra_mesh()
-    export_hex_mesh()
+    # export_tetra_mesh()
+    # export_hex_mesh()
+    export_hybrid()

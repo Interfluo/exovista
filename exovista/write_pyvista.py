@@ -245,6 +245,8 @@ def write_exo(filename, volume: pv.UnstructuredGrid, surface: pv.PolyData = None
     f.close()
 
     # Process meshes
+    volume.point_data["orig_pts"] = np.arange(volume.n_points)
+    volume.cell_data["orig_cell_ids"] = np.arange(volume.n_cells)
     volume_blocks, surfaces = process_meshes(volume, surface, region_key=region_key)
 
     # get basic info
@@ -281,10 +283,8 @@ def write_exo(filename, volume: pv.UnstructuredGrid, surface: pv.PolyData = None
                 logging.warning(f"Unsupported cell type {item['cell_type'].name} in block {key}. Skipping.")
                 continue
             logging.info(f"  - Block {counter}: {exo_cell_type} with {n_block_cells} cells, region {item['region']}")
-            if 'vtkOriginalPointIds' not in mesh.point_data:
-                logging.warning(f"'vtkOriginalPointIds' missing in block {key}. This may cause connectivity issues.")
             # print(f"{item['cell_type'].name} -> {exo_cell_type}")
-            connectivity = mesh['vtkOriginalPointIds'][mesh.cells.reshape(-1, n_cell_nodes+1)[:, 1:]] + 1
+            connectivity = mesh['orig_pts'][mesh.cells.reshape(-1, n_cell_nodes+1)[:, 1:]] + 1
             exof.put_element_block(counter, elem_type=exo_cell_type, num_block_elems=n_block_cells, num_nodes_per_elem=n_cell_nodes)
             exof.put_element_conn(counter, connectivity)
             counter += 1
