@@ -45,8 +45,8 @@ def cell_2_face_center(cell: pv.Cell):
     face_centers = []
     for i in range(cell.n_faces):
         face_centers.append(cell.get_face(i).center)
-    # face_centers_reordered = [face_centers[i] for i in vtk2exo_faceorder[cell.type]]
-    return face_centers
+    face_centers_reordered = [face_centers[i] for i in vtk2exo_faceorder[cell.type]]
+    return face_centers_reordered
 
 
 def get_face_center_info(mesh: pv.UnstructuredGrid, cell_ids: list[int], block_id: int|str) -> pv.PolyData:
