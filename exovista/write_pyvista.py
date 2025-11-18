@@ -17,6 +17,16 @@ vtk2exo = {
     # add more as needed
 }
 
+vtk2exo_faceorder = {
+    pv.CellType.TRIANGLE: [0, 1, 2],
+    pv.CellType.QUAD: [0, 1, 2, 3],
+    pv.CellType.TETRA: [0, 1, 2, 3],
+    pv.CellType.HEXAHEDRON: [3, 1, 0, 2, 4, 5],
+    pv.CellType.WEDGE: [3, 4, 0, 1, 2],
+    pv.CellType.PYRAMID: [4, 0, 1, 2, 3],
+    # add more as needed
+}
+
 
 def cell_2_face_center(cell: pv.Cell):
     """
@@ -35,7 +45,8 @@ def cell_2_face_center(cell: pv.Cell):
     face_centers = []
     for i in range(cell.n_faces):
         face_centers.append(cell.get_face(i).center)
-    return face_centers
+    face_centers_reordered = [face_centers[i] for i in vtk2exo_faceorder[cell.type]]
+    return face_centers_reordered
 
 
 def get_face_center_info(mesh: pv.UnstructuredGrid, cell_ids: list[int], block_id: int|str) -> pv.PolyData:
