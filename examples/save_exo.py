@@ -55,12 +55,14 @@ def export_with_node_arrays():
     volume["tag"] = 1 * (volume.cell_centers().points[:, 0] > 0)
 
     # tool will export volume mesh node arrays to the exo file
-    volume["x"] = volume.points[:, 0]
     volume["fx"] = volume.points[:, 0]**2
 
     surface = volume.extract_surface()
     surface["tag"] = 1 * (surface.cell_centers().points[:, 2] > 0)
-    exovista.write_exo("node_array_test.exo", volume, surface, "tag")
+    exovista.write_exo("node_array_test.exo", volume, surface, "tag",
+                       block_names=["block_one", "block_two"],
+                       side_set_names=["side_one", "side_two"],
+                       save_node_arrays=True)
     return None
 
 
