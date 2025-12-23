@@ -276,7 +276,7 @@ def write_exo(filename, volume: pv.UnstructuredGrid, surface: pv.PolyData = None
     with exodusii_file(filename, mode="w") as exof:
         exof.put_init(title="pyvista_mesh", num_dim=3, num_nodes=n_nodes, num_elem=n_cells,
                       num_elem_blk=n_element_blocks, num_side_sets=n_side_sets, num_node_sets=0)
-        exof.put_coords(volume.points)
+        exof.put_coords(np.array(volume.points))
         logging.info("Initialized ExodusII file and wrote coordinates.")
 
         logging.info("Saving element blocks...")
@@ -299,6 +299,20 @@ def write_exo(filename, volume: pv.UnstructuredGrid, surface: pv.PolyData = None
             exof.put_element_block(counter, elem_type=exo_cell_type, num_block_elems=n_block_cells, num_nodes_per_elem=n_cell_nodes)
             exof.put_element_conn(counter, connectivity)
             counter += 1
+
+        # Write node arrays
+        logging.info("Saving node arrays...")
+        node_array_names, node_arrays = [], []
+        for name in volume.array_names:
+            array = volume[name]
+            if len(array) == n_nodes:
+                node_array_names.append(name)
+                node_arrays.append(array)
+                logging.info(f"  - node array {name} shape =  {array.shape}")
+        exof.put_node_variable_params(len(node_array_names))
+        exof.put_node_variable_names(node_array_names)
+        for i in range(len(node_array_names)):
+            exof.put_node_variable_values(1, node_array_names[i], node_arrays[i])
 
         logging.info("Saving side sets...")
         # Write side sets
