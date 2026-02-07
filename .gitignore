@@ -11,3 +11,6 @@ htmlcov
 /exovista.egg-info
 /.idea
 .DS_Store
+
+# Generated files
+*.exo

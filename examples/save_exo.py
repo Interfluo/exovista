@@ -1,3 +1,4 @@
+import tetgen
 import logging
 import exovista
 import numpy as np
@@ -28,7 +29,6 @@ def export_hex_mesh():
     volume["region"] = 1*(volume.cell_centers().points[:, 1] > 0) + 2*(volume.cell_centers().points[:, 2] > 0)
     volume.plot(show_edges=True, categories=True, parallel_projection=True, text="element blocks")
 
-
     surface["region"] = 1*(surface.cell_centers().points[:, 0] > 0)
     surface.plot(show_edges=True, categories=True, parallel_projection=True, text="side sets")
 
@@ -50,24 +50,27 @@ def export_hybrid():
 
 
 def export_with_node_arrays():
-    volume = pv.examples.download_letter_a()
-    volume.points -= volume.center
-    volume["tag"] = 1 * (volume.cell_centers().points[:, 0] > 0)
-
-    # tool will export volume mesh node arrays to the exo file
-    volume["fx"] = volume.points[:, 0]**2
-
+    mesh = pv.Icosphere(nsub=4)
+    tet = tetgen.TetGen(mesh)
+    tet.tetrahedralize(order=1, mindihedral=20, minratio=1.5)
+    volume = tet.grid
+    # volume = pv.CylinderStructured(radius=np.linspace(1, 2, 24), theta_resolution=128, z_resolution=24).cast_to_unstructured_grid()
     surface = volume.extract_surface()
-    surface["tag"] = 1 * (surface.cell_centers().points[:, 2] > 0)
-    exovista.write_exo("node_array_test.exo", volume, surface, "tag",
-                       block_names=["block_one", "block_two"],
-                       side_set_names=["side_one", "side_two"],
+
+    volume["region"] = 1*(volume.cell_centers().points[:, 1] > 0) + 2*(volume.cell_centers().points[:, 2] > 0)
+    surface["region"] = 1*(surface.cell_centers().points[:, 0] > 0)
+
+    volume["fx"] = np.sin(4*np.pi*volume.points[:, 0])
+
+    exovista.write_exo("node_array_test.exo", volume, surface, # "tag",
+                       # block_names=["block_one", "block_two"],
+                       # side_set_names=["side_one", "side_two"],
                        save_node_arrays=True)
     return None
 
 
 if __name__ == '__main__':
-    # export_tetra_mesh()
-    # export_hex_mesh()
-    # export_hybrid()
+    #export_tetra_mesh()
+    #export_hex_mesh()
+    #export_hybrid()
     export_with_node_arrays()

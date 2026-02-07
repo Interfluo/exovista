@@ -10,8 +10,10 @@ from scipy.interpolate import NearestNDInterpolator
 vtk2exo = {
     pv.CellType.TRIANGLE: 'tri3',
     pv.CellType.QUAD: 'quad4',
+    pv.CellType.PIXEL: 'quad4',
     pv.CellType.TETRA: 'tet4',
     pv.CellType.HEXAHEDRON: 'hex8',
+    pv.CellType.VOXEL: 'hex8',
     pv.CellType.WEDGE: 'wedge6',
     pv.CellType.PYRAMID: 'pyramid5',
     # add more as needed
@@ -20,11 +22,20 @@ vtk2exo = {
 vtk2exo_faceorder = {
     pv.CellType.TRIANGLE: [0, 1, 2],
     pv.CellType.QUAD: [0, 1, 2, 3],
+    pv.CellType.PIXEL: [0, 1, 2, 3],
     pv.CellType.TETRA: [0, 1, 2, 3],
     pv.CellType.HEXAHEDRON: [2, 1, 3, 0, 4, 5],
+    pv.CellType.VOXEL: [2, 1, 3, 0, 4, 5],
     pv.CellType.WEDGE: [2, 3, 4, 0, 1],
     pv.CellType.PYRAMID: [1, 2, 3, 4, 0],
     # add more as needed
+}
+
+# Mapping for node permutation when converting VTK cell to Exodus cell
+# Some VTK cells (like VOXEL, PIXEL) have different node ordering than their Exodus counterparts
+vtk2exo_permute = {
+    pv.CellType.PIXEL: [0, 1, 3, 2],  # Pixel -> Quad
+    pv.CellType.VOXEL: [0, 1, 3, 2, 4, 5, 7, 6],  # Voxel -> Hex
 }
 
 
@@ -43,8 +54,14 @@ def cell_2_face_center(cell: pv.Cell):
         List of face center coordinates as NumPy arrays.
     """
     face_centers = []
-    for i in range(cell.n_faces):
-        face_centers.append(cell.get_face(i).center)
+    if cell.n_faces > 0:
+        for i in range(cell.n_faces):
+            face_centers.append(cell.get_face(i).center)
+    elif cell.n_edges > 0:
+        # For 2D cells (Quad, Tri), "faces" for side sets are edges
+        for i in range(cell.n_edges):
+            face_centers.append(cell.get_edge(i).center)
+            
     face_centers_reordered = [face_centers[i] for i in vtk2exo_faceorder[cell.type]]
     return face_centers_reordered
 
@@ -282,7 +299,7 @@ def write_exo(filename,
     if block_names is None:
         block_names = [f"block_{i}" for i in range(n_element_blocks)]
     if side_set_names is None:
-        side_set_names = [f"block_{i}" for i in range(n_side_sets)]
+        side_set_names = [f"side_{i}" for i in range(n_side_sets)]
 
     logging.info(f"Element blocks: {n_element_blocks}, Side sets: {n_side_sets}, Nodes: {n_nodes}, Cells: {n_cells}")
     if n_element_blocks == 0:
@@ -299,7 +316,7 @@ def write_exo(filename,
 
         # Write element blocks
         logging.info("Saving element blocks...")
-        counter = 0
+        counter = 1
         for key, item in volume_blocks.items():
             mesh = item["mesh"]
             n_block_cells = mesh.n_cells
@@ -314,9 +331,14 @@ def write_exo(filename,
             logging.info(f"  - Block {counter}: {exo_cell_type} with {n_block_cells} cells, region {item['region']}")
             # print(f"{item['cell_type'].name} -> {exo_cell_type}")
             connectivity = mesh['orig_pts'][mesh.cells.reshape(-1, n_cell_nodes+1)[:, 1:]] + 1
+            
+            # Apply permutation if needed (e.g. VOXEL -> HEX)
+            if item["cell_type"] in vtk2exo_permute:
+                perm = vtk2exo_permute[item["cell_type"]]
+                connectivity = connectivity[:, perm]
             exof.put_element_block(counter, elem_type=exo_cell_type, num_block_elems=n_block_cells, num_nodes_per_elem=n_cell_nodes)
             exof.put_element_conn(counter, connectivity)
-            exof.put_element_block_name(counter, block_names[counter])
+            exof.put_element_block_name(counter, block_names[counter-1])
             counter += 1
 
         # Write node arrays
@@ -342,9 +364,9 @@ def write_exo(filename,
                 logging.warning(f"Skipping empty side set {i}")
                 continue
             logging.info(f"  - Side set {i} with {n_sides} sides")
-            exof.put_side_set_param(i, n_sides)
-            exof.put_side_set_sides(i, s["cell_ids"]+1, s["face_ids"]+1)
-            exof.put_side_set_name(i, side_set_names[i])
+            exof.put_side_set_param(i+1, n_sides)
+            exof.put_side_set_sides(i+1, s["cell_ids"]+1, s["face_ids"]+1)
+            exof.put_side_set_name(i+1, side_set_names[i])
 
         exof.close()
         logging.info(f"{filename} saved successfully.")
