@@ -1,80 +1,116 @@
 # ExoVista
 
-An extension of the Sandia exodusii library for exporting PyVista meshes to Exodus format with user-defined element blocks and side sets. This project focuses on a simpler interface for PyVista users (e.g., meshes created via meshio or PyVista’s geometric utilities).
+An extension of the Sandia exodusii library for exporting PyVista meshes to Exodus format with user-defined element blocks and side sets. This project focuses on a simpler interface for PyVista users (e.g., meshes created via meshio or PyVista's geometric utilities).
 
-Note that this code was initially a fork of: https://github.com/sandialabs/exodusii
+> **Note**: This code was initially a fork of: https://github.com/sandialabs/exodusii
 
-# Why ExoVista?
+## Features
 
-While PyVista can read and write Exodus files via meshio, this support is limited. For example, in the SIERRA toolset, element blocks are essential for defining material zones, and side sets are commonly used to assign boundary conditions. Currently, meshio cannot save side sets or user-defined element blocks.
+- **Element Blocks**: Automatically split meshes by cell type and user-defined regions
+- **Side Sets**: Define boundary conditions via surface meshes with region arrays
+- **2D & 3D Support**: Works with Quads, Triangles, Hexahedra, Tetrahedra, Wedges, Pyramids
+- **VTK Compatibility**: Handles VOXEL and PIXEL cell types (auto-permuted to Exodus ordering)
+- **Node Arrays**: Save point data arrays to the Exodus file
+- **Named Blocks/Sets**: Optionally provide custom names for element blocks and side sets
 
-ExoVista makes it easy to define side sets and element blocks by assigning a "region" cell array to the surface and volume meshes. Internally, the library automatically splits element blocks by cell type before exporting to an Exodus file.
+## Installation
 
-## Usage
-basic imports
-```python
-import exovista
-import numpy as np
-import pyvista as pv
-```
-
-Load the letter_a PyVista example (a tetrahedral volume mesh).
-After centering the mesh, extract the surface and assign cell-wise region arrays that define element blocks and side sets in the exported Exodus file.
-```python
-def export_tetra_mesh():
-    volume = pv.examples.download_letter_a()
-    volume.points -= volume.center
-    volume["tag"] = 1 * (volume.cell_centers().points[:, 0] > 0)
-    volume.plot(show_edges=True, categories=True, parallel_projection=True, text="element blocks")
-
-    surface = volume.extract_surface()
-    surface["tag"] = 1 * (surface.cell_centers().points[:, 2] > 0)
-    surface.plot(show_edges=True, categories=True, parallel_projection=True, text="side sets")
-
-    exovista.write_exo("tetra.exo", volume, surface, "tag")
-    return None
-```
-<div style="display: flex; gap: 10px;">
-  <img src="https://github.com/user-attachments/assets/38b84cb6-7b45-43fa-82a4-1ae72bd81b14" width="48%">
-  <img src="https://github.com/user-attachments/assets/1140ffbf-c8b3-4e88-8db6-47c421d3fccc" width="48%">
-</div>
-
-This example constructs a structured cylindrical volume made of hexahedral cells.
-As before, extract the surface and assign region arrays before exporting.
-```python
-def export_hex_mesh():
-    volume = pv.CylinderStructured(radius=np.linspace(1, 2, 5)).cast_to_unstructured_grid()
-    surface = volume.extract_surface()
-
-    volume["region"] = 1*(volume.cell_centers().points[:, 1] > 0) + 2*(volume.cell_centers().points[:, 2] > 0)
-    volume.plot(show_edges=True, categories=True, parallel_projection=True, text="element blocks")
-
-
-    surface["region"] = 1*(surface.cell_centers().points[:, 0] > 0)
-    surface.plot(show_edges=True, categories=True, parallel_projection=True, text="side sets")
-
-    exovista.write_exo("hex.exo", volume, surface)
-    exovista.write_exo("hex_no_sides.exo", volume, None)
-    return None
-```
-<div style="display: flex; gap: 10px;">
-  <img src="https://github.com/user-attachments/assets/2cdf9a4a-fdc6-491b-9e3b-724d2d817c92" width="48%">
-  <img src="https://github.com/user-attachments/assets/7400879b-49a3-45d6-8d4f-3f4297fbf166" width="48%">
-</div>
-
-## Install
-install from pypi
+### From PyPI
 ```shell
 pip install exovista
 ```
-install editable version
+
+### Editable Install (Development)
 ```shell
 git clone https://github.com/Interfluo/exovista.git
 cd exovista
 pip install -e .
 ```
 
+## Quick Start
+
+```python
+import exovista
+import numpy as np
+import pyvista as pv
+
+# Load a tetrahedral mesh
+volume = pv.examples.download_letter_a()
+volume.points -= volume.center
+
+# Assign regions for element blocks
+volume["region"] = 1 * (volume.cell_centers().points[:, 0] > 0)
+
+# Extract surface and assign regions for side sets
+surface = volume.extract_surface()
+surface["region"] = 1 * (surface.cell_centers().points[:, 2] > 0)
+
+# Write to Exodus file
+exovista.write_exo("output.exo", volume, surface, region_key="region")
+```
+
+## API Reference
+
+### `exovista.write_exo`
+
+```python
+write_exo(
+    filename: str,
+    volume: pv.UnstructuredGrid,
+    surface: pv.PolyData = None,
+    region_key: str = "region",
+    block_names: list[str] = None,
+    side_set_names: list[str] = None,
+    save_node_arrays: bool = True,
+)
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filename` | `str` | Output Exodus file path |
+| `volume` | `pv.UnstructuredGrid` | Volume mesh containing cells |
+| `surface` | `pv.PolyData` | Surface mesh for side sets (optional) |
+| `region_key` | `str` | Cell data array name used to split blocks/sets |
+| `block_names` | `list[str]` | Custom names for element blocks |
+| `side_set_names` | `list[str]` | Custom names for side sets |
+| `save_node_arrays` | `bool` | Whether to save point data arrays |
+
+## Examples
+
+Example scripts are located in the `examples/` directory:
+
+| Script | Description |
+|--------|-------------|
+| `example_2d_quads.py` | 2D Quad mesh with regions |
+| `example_multi_block.py` | Multi-block Hex mesh split by regions |
+| `example_side_sets.py` | 3D Tet mesh with side sets |
+| `example_mixed_elements.py` | Mixed Hex and Tet elements |
+| `save_exo.py` | Comprehensive example with multiple mesh types |
+
+Run an example:
+```shell
+python examples/example_2d_quads.py
+```
+
+## Development
+
+### Running Tests
+```shell
+PYTHONPATH=. python test/test_2d_save.py
+PYTHONPATH=. python test/test_write_exo.py
+PYTHONPATH=. python test/test_connectivity.py
+```
+
+### Cleaning Generated Files
+```shell
+python clean.py
+```
+
+This removes generated `.exo` files, `__pycache__` directories, and temporary test outputs.
+
 ## Copyright
+
 This repo is a fork of https://github.com/sandialabs/exodusii and therefore inherits the below copyright: 
 
 ```

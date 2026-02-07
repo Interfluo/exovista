@@ -1,4 +1,23 @@
+"""
+PyVista to ExodusII export module.
+
+This module provides functionality for exporting PyVista UnstructuredGrid meshes
+to ExodusII format with support for:
+- Element blocks (split by cell type and user-defined regions)
+- Side sets (mapped from surface meshes)
+- Node arrays (point data)
+- Custom block and side set names
+
+Supported Cell Types:
+    - 2D: TRIANGLE, QUAD, PIXEL
+    - 3D: TETRA, HEXAHEDRON, VOXEL, WEDGE, PYRAMID
+
+Note: VOXEL and PIXEL cells are automatically permuted to Exodus ordering.
+"""
+
 import logging
+from typing import Optional
+
 import numpy as np
 import pyvista as pv
 

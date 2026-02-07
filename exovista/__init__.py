@@ -1,3 +1,17 @@
+"""
+ExoVista - PyVista to ExodusII Export Library.
+
+This library extends the Sandia exodusii library to provide a simple interface
+for exporting PyVista meshes to ExodusII format with user-defined element blocks
+and side sets.
+
+Key Functions:
+    write_exo: Write PyVista meshes to ExodusII format
+    File: Open ExodusII files for reading or writing
+    allclose: Compare ExodusII files for numerical equality
+    similar: Compare ExodusII files for structural similarity
+"""
+
 from .file import exodusii_file, ExodusIIFile, write_globals
 from .parallel_file import parallel_exodusii_file, MFExodusIIFile
 from .allclose import allclose
@@ -7,6 +21,29 @@ from .lineout import lineout
 from .find_in_region import find_element_data_in_region, find_node_data_in_region
 from .exoread import main as exoread
 from .write_pyvista import write_exo
+
+__all__ = [
+    # Core file operations
+    "File",
+    "exo_file",
+    "exodusii_file",
+    "ExodusIIFile",
+    "write_globals",
+    # Parallel file operations
+    "parallel_exodusii_file",
+    "MFExodusIIFile",
+    # Comparison utilities
+    "allclose",
+    "similar",
+    # Data extraction
+    "lineout",
+    "find_element_data_in_region",
+    "find_node_data_in_region",
+    # CLI
+    "exoread",
+    # PyVista export
+    "write_exo",
+]
 
 def File(filename, *files, mode="r"):
 
