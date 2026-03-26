@@ -16,8 +16,6 @@ Note: VOXEL and PIXEL cells are automatically permuted to Exodus ordering.
 """
 
 import logging
-from typing import Optional
-
 import numpy as np
 import pyvista as pv
 from scipy.spatial import cKDTree
