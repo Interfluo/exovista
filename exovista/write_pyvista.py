@@ -20,10 +20,9 @@ from typing import Optional
 
 import numpy as np
 import pyvista as pv
+from scipy.spatial import cKDTree
 
 from .file import exodusii_file
-
-from scipy.interpolate import NearestNDInterpolator
 
 
 vtk2exo = {
@@ -57,134 +56,144 @@ vtk2exo_permute = {
     pv.CellType.VOXEL: [0, 1, 3, 2, 4, 5, 7, 6],  # Voxel -> Hex
 }
 
+# VTK face definitions: for each cell type, the local node indices forming each face.
+# For 2D cells, "faces" are edges. For 3D cells, faces are actual faces.
+# These are in VTK face ordering (will be reordered by vtk2exo_faceorder).
+_vtk_face_nodes = {
+    pv.CellType.TRIANGLE: [
+        [0, 1],  # edge 0
+        [1, 2],  # edge 1
+        [2, 0],  # edge 2
+    ],
+    pv.CellType.QUAD: [
+        [0, 1],  # edge 0
+        [1, 2],  # edge 1
+        [2, 3],  # edge 2
+        [3, 0],  # edge 3
+    ],
+    pv.CellType.PIXEL: [
+        [0, 1],  # edge 0
+        [1, 3],  # edge 1
+        [2, 3],  # edge 2
+        [0, 2],  # edge 3
+    ],
+    pv.CellType.TETRA: [
+        [0, 1, 3],  # face 0
+        [1, 2, 3],  # face 1
+        [2, 0, 3],  # face 2
+        [0, 2, 1],  # face 3
+    ],
+    pv.CellType.HEXAHEDRON: [
+        [0, 4, 7, 3],  # face 0
+        [1, 2, 6, 5],  # face 1
+        [0, 1, 5, 4],  # face 2
+        [3, 7, 6, 2],  # face 3
+        [0, 3, 2, 1],  # face 4
+        [4, 5, 6, 7],  # face 5
+    ],
+    pv.CellType.VOXEL: [
+        [2, 0, 6, 4],  # face 0
+        [1, 3, 5, 7],  # face 1
+        [0, 1, 4, 5],  # face 2
+        [3, 2, 7, 6],  # face 3
+        [1, 0, 3, 2],  # face 4
+        [4, 5, 6, 7],  # face 5
+    ],
+    pv.CellType.WEDGE: [
+        [0, 1, 2],     # face 0
+        [3, 5, 4],     # face 1
+        [0, 3, 4, 1],  # face 2
+        [1, 4, 5, 2],  # face 3
+        [2, 5, 3, 0],  # face 4
+    ],
+    pv.CellType.PYRAMID: [
+        [0, 3, 2, 1],  # face 0
+        [0, 1, 4],     # face 1
+        [1, 2, 4],     # face 2
+        [2, 3, 4],     # face 3
+        [3, 0, 4],     # face 4
+    ],
+}
 
-def cell_2_face_center(cell: pv.Cell):
+
+def _compute_face_centers_vectorized(coords, connectivity, cell_type):
     """
-    Compute the center points of all faces in a given PyVista cell.
+    Compute face centers for all cells of a given type using vectorized numpy ops.
 
     Parameters
     ----------
-    cell : pv.Cell
-        The PyVista cell object.
+    coords : np.ndarray, shape (n_total_points, 3)
+        Global coordinate array.
+    connectivity : np.ndarray, shape (n_cells, n_nodes_per_cell)
+        Global node indices for each cell.
+    cell_type : pv.CellType
+        The VTK cell type.
 
     Returns
     -------
-    list[np.ndarray]
-        List of face center coordinates as NumPy arrays.
+    np.ndarray, shape (n_cells * n_faces, 3)
+        Face center coordinates in Exodus face ordering.
     """
-    face_centers = []
-    if cell.n_faces > 0:
-        for i in range(cell.n_faces):
-            face_centers.append(cell.get_face(i).center)
-    elif cell.n_edges > 0:
-        # For 2D cells (Quad, Tri), "faces" for side sets are edges
-        for i in range(cell.n_edges):
-            face_centers.append(cell.get_edge(i).center)
-            
-    face_centers_reordered = [face_centers[i] for i in vtk2exo_faceorder[cell.type]]
-    return face_centers_reordered
+    vtk_faces = _vtk_face_nodes[cell_type]
+    face_order = vtk2exo_faceorder[cell_type]
+    n_cells = connectivity.shape[0]
+    n_faces = len(vtk_faces)
+
+    # Reorder faces from VTK to Exodus ordering
+    ordered_faces = [vtk_faces[i] for i in face_order]
+
+    all_centers = np.empty((n_cells, n_faces, 3), dtype=np.float64)
+    for exo_fid, face_nodes in enumerate(ordered_faces):
+        # face_nodes: list of local node indices for this face
+        # connectivity[:, face_nodes] -> (n_cells, n_nodes_in_face) global node IDs
+        face_global_ids = connectivity[:, face_nodes]  # (n_cells, n_nodes_in_face)
+        # coords[face_global_ids] -> (n_cells, n_nodes_in_face, 3)
+        face_coords = coords[face_global_ids]
+        # Mean across nodes -> (n_cells, 3)
+        all_centers[:, exo_fid, :] = face_coords.mean(axis=1)
+
+    # Reshape to (n_cells * n_faces, 3)
+    return all_centers.reshape(-1, 3)
 
 
-def get_face_center_info(mesh: pv.UnstructuredGrid, cell_ids: list[int], block_id: int|str) -> pv.PolyData:
+def _get_block_face_info_vectorized(coords, connectivity, cell_ids, cell_type, block_id):
     """
-    Generate a PolyData object containing face center points for all cells in the mesh,
-    annotated with cell IDs, face IDs, and block IDs.
-
-    This is used for mapping surface faces to volume faces via interpolation.
+    Compute face center info for a block, returning arrays instead of PolyData.
 
     Parameters
     ----------
-    mesh : pv.UnstructuredGrid
-        The input volume mesh.
-    cell_ids : list[int]
-        Global cell IDs for the cells in the mesh.
-    block_id : int | str
-        The block ID (region) for this mesh block.
+    coords : np.ndarray, shape (n_total_points, 3)
+        Global coordinate array.
+    connectivity : np.ndarray, shape (n_cells, n_nodes_per_cell)
+        Global node indices for each cell.
+    cell_ids : np.ndarray
+        Global cell IDs for the cells in this block.
+    cell_type : pv.CellType
+        The VTK cell type.
+    block_id : int or str
+        The block ID (region) for this block.
 
     Returns
     -------
-    pv.PolyData
-        Point cloud of face centers with associated data arrays.
+    tuple of (points, face_cell_ids, face_ids, block_ids)
+        All as numpy arrays.
     """
-    points, face_cell_ids, face_ids, block_ids = [], [], [], []
+    n_faces = len(_vtk_face_nodes[cell_type])
+    n_cells = len(cell_ids)
 
-    for cell_index in range(mesh.n_cells):
-        for fid, fc in enumerate(cell_2_face_center(mesh.get_cell(cell_index))):
-            points.append(fc)
-            face_cell_ids.append(cell_ids[cell_index])
-            face_ids.append(fid)
-            block_ids.append(block_id)
+    # Face centers: (n_cells * n_faces, 3)
+    centers = _compute_face_centers_vectorized(coords, connectivity, cell_type)
 
-    points = pv.PolyData(np.array(points))
-    points["cell_ids"] = np.array(face_cell_ids)
-    points["face_ids"] = np.array(face_ids)
-    points["block_ids"] = np.array(block_ids)
-    return points
+    # cell_ids repeated for each face: [c0,c0,...,c1,c1,...,...]
+    face_cell_ids = np.repeat(cell_ids, n_faces)
 
+    # face_ids cycle: [0,1,...,n_faces-1, 0,1,...,n_faces-1, ...]
+    face_ids = np.tile(np.arange(n_faces), n_cells)
 
-def _process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key: str = "region") -> tuple[dict, pv.MultiBlock]:
-    """
-    Process volume and surface meshes to prepare for ExodusII export.
+    # block_ids: constant
+    block_ids = np.full(n_cells * n_faces, block_id)
 
-    Splits the volume mesh into blocks by cell type and region. Maps surface faces
-    to corresponding volume faces using nearest-neighbor interpolation.
-
-    Parameters
-    ----------
-    volume : pv.UnstructuredGrid
-        The volume mesh.
-    surface : pv.PolyData
-        The surface mesh.
-    region_key : str, optional
-        The name of the cell data array defining regions (default is "region").
-
-    Returns
-    -------
-    tuple[dict, pv.MultiBlock]
-        Dictionary of volume blocks and MultiBlock of surface side sets.
-    """
-    # Check and fallback for volume regions
-    if region_key not in volume.cell_data:
-        logging.warning(f"Region key '{region_key}' not found in volume cell data. Setting all regions to 1.")
-        volume.cell_data[region_key] = np.ones(volume.n_cells, dtype=int)
-
-    # Check and fallback for surface regions
-    if region_key not in surface.cell_data:
-        logging.warning(f"Region key '{region_key}' not found in surface cell data. Setting all regions to 1.")
-        surface.cell_data[region_key] = np.ones(surface.n_cells, dtype=int)
-
-    volume_regions = np.unique(volume[region_key])
-    surface_regions = np.unique(surface[region_key])
-    logging.info(f"Volume regions found: {volume_regions}")
-    logging.info(f"Surface regions found: {surface_regions}")
-
-    # Split volume blocks by cell_type and region
-    volume_blocks = {}
-    cell_id, counter = 0, 0
-    for cell_type in pv.CellType:
-        volume_cell_type = volume.extract_cells_by_type(cell_type)
-        if volume_cell_type.n_cells > 0:
-            logging.info(f"Processing cell type: {cell_type.name} with {volume_cell_type.n_cells} cells")
-            for m in volume_cell_type.split_values(scalars=region_key):
-                region_value = m[region_key][0] if region_key in m.cell_data else 1
-                logging.info(f"  - Sub-block with region {region_value} and {m.n_cells} cells")
-                volume_blocks[counter] = {"region": region_value, "cell_type": cell_type, "mesh": m, "cell_ids": [i+cell_id for i in range(m.n_cells)]}
-                cell_id += m.n_cells
-                counter += 1
-
-    if not volume_blocks:
-        logging.warning("No volume blocks found after processing. Export may fail.")
-
-    # Compute face centers for interpolation
-    face_points = pv.MultiBlock([get_face_center_info(item["mesh"], item["cell_ids"], item["region"]) for key, item in volume_blocks.items()]).combine()
-    logging.info(f"Generated {face_points.n_points} face center points for interpolation.")
-
-    # Map surface to volume faces
-    for s in ["block_ids", "cell_ids", "face_ids"]:
-        surface[s] = NearestNDInterpolator(face_points.points, face_points[s])(surface.cell_centers().points)
-    logging.info("Surface face mapping completed.")
-
-    return volume_blocks, surface.split_values(scalars=region_key)
+    return centers, face_cell_ids, face_ids, block_ids
 
 
 def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key: str = "region") -> tuple[dict, pv.MultiBlock]:
@@ -192,7 +201,7 @@ def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key
     Process volume and surface meshes to prepare for ExodusII export.
 
     Splits the volume mesh into blocks by cell type and region. Maps surface faces
-    to corresponding volume faces using nearest-neighbor interpolation.
+    to corresponding volume faces using KD-tree nearest-neighbor lookup.
 
     Parameters
     ----------
@@ -217,42 +226,84 @@ def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key
     logging.info(f"Volume regions found: {volume_regions}")
 
     if surface is not None:
-        # Check and fallback for surface regions
         if region_key not in surface.cell_data:
             logging.warning(f"Region key '{region_key}' not found in surface cell data. Setting all regions to 1.")
             surface.cell_data[region_key] = np.ones(surface.n_cells, dtype=int)
-
         surface_regions = np.unique(surface[region_key])
         logging.info(f"Surface regions found: {surface_regions}")
     else:
-        surface_regions = []
         logging.info("No surface provided. Skipping surface processing.")
 
-    # Split volume blocks by cell_type and region
+    # Split volume blocks by cell_type and region - only iterate over types that exist
     volume_blocks = {}
     cell_id, counter = 0, 0
-    for cell_type in pv.CellType:
+    unique_cell_types = np.unique(volume.celltypes)
+
+    for ct_value in unique_cell_types:
+        cell_type = pv.CellType(ct_value)
+        if cell_type not in vtk2exo:
+            logging.warning(f"Unsupported cell type {cell_type.name} ({ct_value}). Skipping.")
+            continue
+
         volume_cell_type = volume.extract_cells_by_type(cell_type)
-        if volume_cell_type.n_cells > 0:
-            logging.info(f"Processing cell type: {cell_type.name} with {volume_cell_type.n_cells} cells")
-            for m in volume_cell_type.split_values(scalars=region_key):
-                region_value = m[region_key][0] if region_key in m.cell_data else 1
-                logging.info(f"  - Sub-block with region {region_value} and {m.n_cells} cells")
-                volume_blocks[counter] = {"region": region_value, "cell_type": cell_type, "mesh": m, "cell_ids": [i+cell_id for i in range(m.n_cells)]}
-                cell_id += m.n_cells
-                counter += 1
+        if volume_cell_type.n_cells == 0:
+            continue
+
+        logging.info(f"Processing cell type: {cell_type.name} with {volume_cell_type.n_cells} cells")
+        for m in volume_cell_type.split_values(scalars=region_key):
+            region_value = m[region_key][0] if region_key in m.cell_data else 1
+            logging.info(f"  - Sub-block with region {region_value} and {m.n_cells} cells")
+            volume_blocks[counter] = {
+                "region": region_value,
+                "cell_type": cell_type,
+                "mesh": m,
+                "cell_ids": np.arange(cell_id, cell_id + m.n_cells),
+            }
+            cell_id += m.n_cells
+            counter += 1
 
     if not volume_blocks:
         logging.warning("No volume blocks found after processing. Export may fail.")
 
     if surface is not None:
-        # Compute face centers for interpolation
-        face_points = pv.MultiBlock([get_face_center_info(item["mesh"], item["cell_ids"], item["region"]) for key, item in volume_blocks.items()]).combine()
-        logging.info(f"Generated {face_points.n_points} face center points for interpolation.")
+        # Build face center KD-tree using vectorized computation
+        all_centers = []
+        all_cell_ids = []
+        all_face_ids = []
+        all_block_ids = []
 
-        # Map surface to volume faces
-        for s in ["block_ids", "cell_ids", "face_ids"]:
-            surface[s] = NearestNDInterpolator(face_points.points, face_points[s])(surface.cell_centers().points)
+        coords = volume.points
+
+        for key, item in volume_blocks.items():
+            mesh = item["mesh"]
+            n_nodes_per_cell = mesh.get_cell(0).n_points
+            # Extract global node indices from the orig_pts mapping
+            local_conn = mesh.cells.reshape(-1, n_nodes_per_cell + 1)[:, 1:]
+            global_conn = mesh['orig_pts'][local_conn]
+
+            centers, fc_ids, f_ids, b_ids = _get_block_face_info_vectorized(
+                coords, global_conn, item["cell_ids"], item["cell_type"], item["region"]
+            )
+            all_centers.append(centers)
+            all_cell_ids.append(fc_ids)
+            all_face_ids.append(f_ids)
+            all_block_ids.append(b_ids)
+
+        all_centers = np.concatenate(all_centers)
+        all_cell_ids = np.concatenate(all_cell_ids)
+        all_face_ids = np.concatenate(all_face_ids)
+        all_block_ids = np.concatenate(all_block_ids)
+
+        logging.info(f"Generated {len(all_centers)} face center points for interpolation.")
+
+        # Single KD-tree query for all surface cell centers
+        tree = cKDTree(all_centers)
+        query_points = surface.cell_centers().points
+        _, indices = tree.query(query_points)
+
+        surface["cell_ids"] = all_cell_ids[indices]
+        surface["face_ids"] = all_face_ids[indices]
+        surface["block_ids"] = all_block_ids[indices]
         logging.info("Surface face mapping completed.")
 
         surfaces = surface.split_values(scalars=region_key)
@@ -348,9 +399,8 @@ def write_exo(filename,
                 logging.warning(f"Unsupported cell type {item['cell_type'].name} in block {key}. Skipping.")
                 continue
             logging.info(f"  - Block {counter}: {exo_cell_type} with {n_block_cells} cells, region {item['region']}")
-            # print(f"{item['cell_type'].name} -> {exo_cell_type}")
             connectivity = mesh['orig_pts'][mesh.cells.reshape(-1, n_cell_nodes+1)[:, 1:]] + 1
-            
+
             # Apply permutation if needed (e.g. VOXEL -> HEX)
             if item["cell_type"] in vtk2exo_permute:
                 perm = vtk2exo_permute[item["cell_type"]]
@@ -391,4 +441,3 @@ def write_exo(filename,
         logging.info(f"{filename} saved successfully.")
 
     return None
-
