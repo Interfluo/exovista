@@ -311,6 +311,51 @@ def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key
     return volume_blocks, surfaces
 
 
+def _validate_time_fields(fields, n_steps, n_entities, kind):
+    """Validate and normalize a dict of time-varying fields.
+
+    Each field is coerced to a ``(n_steps, n_entities)`` float array. A 1D
+    array of length ``n_entities`` is accepted only when ``n_steps == 1``
+    (i.e. a single time step).
+
+    Parameters
+    ----------
+    fields : dict or None
+        Mapping of variable name to array_like values.
+    n_steps : int
+        Number of time steps.
+    n_entities : int
+        Number of nodes (for node fields) or cells (for element fields).
+    kind : str
+        Either "node" or "element", used for error messages.
+
+    Returns
+    -------
+    dict
+        Mapping of name to validated ``(n_steps, n_entities)`` float arrays.
+    """
+    if not fields:
+        return {}
+
+    validated = {}
+    for name, values in fields.items():
+        arr = np.asarray(values, dtype=float)
+        if arr.ndim == 1:
+            if n_steps != 1:
+                raise ValueError(
+                    f"{kind} field '{name}' is 1D but {n_steps} time steps were "
+                    f"requested. Provide an array of shape (n_steps, {n_entities})."
+                )
+            arr = arr[np.newaxis, :]
+        if arr.shape != (n_steps, n_entities):
+            raise ValueError(
+                f"{kind} field '{name}' has shape {arr.shape}, expected "
+                f"({n_steps}, {n_entities})."
+            )
+        validated[name] = arr
+    return validated
+
+
 def write_exo(filename,
               volume: pv.UnstructuredGrid,
               surface: pv.PolyData = None,
@@ -318,6 +363,9 @@ def write_exo(filename,
               block_names: list[str] = None,
               side_set_names: list[str] = None,
               save_node_arrays: bool = True,
+              times: "np.ndarray | list | None" = None,
+              node_fields: dict = None,
+              element_fields: dict = None,
               ):
 
     """
@@ -325,6 +373,11 @@ def write_exo(filename,
 
     Handles element blocks and side sets based on region assignments.
     Automatically splits blocks by cell type as required by ExodusII.
+
+    Time-varying results can be written by supplying ``times`` together with
+    ``node_fields`` and/or ``element_fields``. Each field array has one row per
+    time step, allowing the data to evolve over the time history stored in the
+    file (e.g. a transient simulation result).
 
     Parameters
     ----------
@@ -341,7 +394,23 @@ def write_exo(filename,
     side_set_names: list[str], optional
         list of names for the side sets, default naming is ["set_0", "set_1" ...]
     save_node_arrays: bool = True,
-        if True, will save node arrays from volume mesh to the exo file
+        if True, will save the static node arrays (point data) from the volume
+        mesh to the exo file. Static arrays are broadcast across every time step.
+    times : array_like, optional
+        Sequence of time values, one per time step. When provided, the file
+        stores a time history of length ``len(times)`` and the field arrays in
+        ``node_fields``/``element_fields`` must provide one row per time value.
+        If omitted, a single time step (t=0) is written.
+    node_fields : dict, optional
+        Mapping of node variable name to an array of shape
+        ``(n_steps, n_nodes)`` giving the value at every node and time step.
+        For a single time step a 1D array of length ``n_nodes`` is also accepted.
+    element_fields : dict, optional
+        Mapping of element variable name to an array of shape
+        ``(n_steps, n_cells)``. Columns are indexed in the original ``volume``
+        cell order; values are automatically distributed to the appropriate
+        element blocks. For a single time step a 1D array of length ``n_cells``
+        is also accepted.
 
     Returns
     -------
@@ -375,6 +444,21 @@ def write_exo(filename,
     if n_side_sets == 0:
         logging.warning("No side sets to write.")
 
+    # Determine the time history and validate any time-varying fields.
+    if times is not None:
+        times = np.asarray(times, dtype=float).ravel()
+        n_steps = len(times)
+        if n_steps == 0:
+            raise ValueError("'times' was provided but contains no time values.")
+    else:
+        n_steps = 1
+    node_fields = _validate_time_fields(node_fields, n_steps, n_nodes, "node")
+    element_fields = _validate_time_fields(element_fields, n_steps, n_cells, "element")
+    has_time_data = bool(node_fields) or bool(element_fields) or times is not None
+    if has_time_data:
+        logging.info(f"Writing {n_steps} time step(s): "
+                     f"{len(node_fields)} node field(s), {len(element_fields)} element field(s).")
+
     # Write exodus file
     with exodusii_file(filename, mode="w") as exof:
         exof.put_init(title="pyvista_mesh", num_dim=3, num_nodes=n_nodes, num_elem=n_cells,
@@ -406,22 +490,64 @@ def write_exo(filename,
             exof.put_element_block(counter, elem_type=exo_cell_type, num_block_elems=n_block_cells, num_nodes_per_elem=n_cell_nodes)
             exof.put_element_conn(counter, connectivity)
             exof.put_element_block_name(counter, block_names[counter-1])
+            # Record the Exodus block ID so time-varying element fields can be
+            # mapped back to this block later.
+            item["exo_block_id"] = counter
             counter += 1
 
-        # Write node arrays
+        # Write the time history. Node and element variables are stored per
+        # time step, so the time values must exist before writing them.
+        if times is not None:
+            for step in range(n_steps):
+                exof.put_time(step + 1, float(times[step]))
+        elif has_time_data:
+            # A single, implicit time step at t = 0.
+            exof.put_time(1, 0.0)
+
+        # Collect static node arrays (point data). Time-varying node_fields take
+        # precedence over a static array of the same name.
+        static_node_arrays = {}
         if save_node_arrays:
-            logging.info("Saving node arrays...")
-            node_array_names, node_arrays = [], []
             for name in volume.array_names:
                 array = volume[name]
-                if len(array) == n_nodes:
-                    node_array_names.append(name)
-                    node_arrays.append(array)
-                    logging.info(f"  - node array {name} shape =  {array.shape}")
-            exof.put_node_variable_params(len(node_array_names))
-            exof.put_node_variable_names(node_array_names)
-            for i in range(len(node_array_names)):
-                exof.put_node_variable_values(1, node_array_names[i], node_arrays[i])
+                if len(array) == n_nodes and name not in node_fields:
+                    static_node_arrays[name] = np.asarray(array, dtype=float)
+                    logging.info(f"  - static node array {name} shape = {array.shape}")
+
+        # Register all node variables (static + time-varying) in a single pass.
+        node_var_names = list(static_node_arrays) + list(node_fields)
+        if node_var_names:
+            logging.info("Saving node variables...")
+            exof.put_node_variable_params(len(node_var_names))
+            exof.put_node_variable_names(node_var_names)
+            # Static arrays are broadcast across every time step so they remain
+            # valid at each one.
+            for name, values in static_node_arrays.items():
+                for step in range(n_steps):
+                    exof.put_node_variable_values(step + 1, name, values)
+            for name, arr in node_fields.items():
+                logging.info(f"  - node field {name} shape = {arr.shape}")
+                for step in range(n_steps):
+                    exof.put_node_variable_values(step + 1, name, arr[step])
+
+        # Register and write time-varying element variables. Values are supplied
+        # in the original volume cell order and distributed to each block using
+        # the 'orig_cell_ids' mapping recorded during mesh processing.
+        if element_fields:
+            logging.info("Saving element variables...")
+            elem_var_names = list(element_fields)
+            exof.put_element_variable_params(len(elem_var_names))
+            exof.put_element_variable_names(elem_var_names)
+            for key, item in volume_blocks.items():
+                block_id = item.get("exo_block_id")
+                if block_id is None:
+                    continue
+                block_cell_ids = item["mesh"]["orig_cell_ids"]
+                for name, arr in element_fields.items():
+                    for step in range(n_steps):
+                        exof.put_element_variable_values(
+                            step + 1, block_id, name, arr[step][block_cell_ids]
+                        )
 
         logging.info("Saving side sets...")
         # Write side sets
