@@ -111,7 +111,24 @@ def create_dimension(fh, name, value):
 
 def create_variable(fh, id, type, shape):
     kind = {str: "c", int: "i", float: "f"}[type]
-    fh.createVariable(id, kind, shape)
+    fh.createVariable(id, kind, shape, **_compression_kwds(fh, shape))
+
+
+def _compression_kwds(fh, shape):
+    """Return netCDF4 compression keywords for createVariable, when applicable.
+
+    Compression (HDF5 deflate) is only available for the netCDF4 backed
+    formats; it is silently skipped for the netCDF3 fallback and for the pure
+    Python netcdf writer. Scalar variables (no dimensions) cannot be chunked,
+    so they are left uncompressed.
+    """
+    level = getattr(config, "compression_level", 0)
+    if not _netcdf4 or not level or not shape:
+        return {}
+    # zlib/chunking is only supported by the HDF5 based NETCDF4* data models.
+    if not str(getattr(fh, "data_model", "")).startswith("NETCDF4"):
+        return {}
+    return {"zlib": True, "complevel": int(level), "shuffle": True}
 
 
 def fill_variable(fh, name, *args):
