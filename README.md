@@ -12,6 +12,7 @@ An extension of the Sandia exodusii library for exporting PyVista meshes to Exod
 - **VTK Compatibility**: Handles VOXEL and PIXEL cell types (auto-permuted to Exodus ordering)
 - **Node Arrays**: Save point data arrays to the Exodus file
 - **Time-Varying Fields**: Write a time history of node and element results (transient data)
+- **Compressed Output**: Array data is zlib/deflate compressed by default (netCDF4), dramatically shrinking file size
 - **Named Blocks/Sets**: Optionally provide custom names for element blocks and side sets
 
 ## Installation
@@ -111,6 +112,21 @@ exovista.write_exo(
 
 For a single time step a 1D array (length `n_nodes` or `n_cells`) is also
 accepted. The resulting file animates over time in ParaView.
+
+### Output Compression
+
+When writing netCDF4 files (the default), array variables are stored with
+zlib/deflate compression, which typically shrinks output files by an order of
+magnitude with negligible effect on read performance. The behavior is
+controlled by an environment variable:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EXODUSII_COMPRESSION_LEVEL` | `1` | Deflate level. `1` is fast and captures most of the savings; `9` is maximum compression; `0` disables it (legacy uncompressed output). |
+
+Compression only applies to the netCDF4 backend; it is skipped automatically
+for the netCDF3 fallback. Files remain standard ExodusII and are readable by
+ParaView, Sierra, and other Exodus tools without any changes.
 
 ## Examples
 
