@@ -1,6 +1,6 @@
 [project]
 name = "exovista"
-version = "1.1.1"
+version = "1.2.0"
 description = "Export and import PyVista meshes to and from the ExodusII finite element database format"
 readme = "README.md"
 requires-python = ">=3.10"
