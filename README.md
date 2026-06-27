@@ -126,7 +126,8 @@ read_exo(
     time_step: int = -1,
     read_node_variables: bool = True,
     read_element_variables: bool = True,
-) -> pv.UnstructuredGrid
+    read_side_sets: bool = False,
+) -> pv.UnstructuredGrid | tuple[pv.UnstructuredGrid, pv.MultiBlock]
 ```
 
 **Parameters:**
@@ -137,6 +138,7 @@ read_exo(
 | `time_step` | `int` | 1-based time step to sample variables at; negative indexes from the end (`-1` = last step) |
 | `read_node_variables` | `bool` | Load node variables into `point_data` |
 | `read_element_variables` | `bool` | Load element variables into `cell_data` |
+| `read_side_sets` | `bool` | Also reconstruct side sets and return them alongside the grid |
 
 The returned grid reconstructs node coordinates (2D meshes are embedded in 3D
 with `z = 0`) and all element blocks, concatenated in block order. Each cell
@@ -146,11 +148,21 @@ requested `time_step`, and the full time history is available in
 `grid.field_data["times"]` (`grid.field_data["num_dim"]` holds the original
 spatial dimension).
 
+When `read_side_sets=True`, a second value is returned: a `pv.MultiBlock` with
+one `pv.PolyData` per side set (named after the side set), whose faces are
+rebuilt over the shared volume nodes. Each face carries `orig_elem_id` (1-based
+Exodus element id) and `face_id` (1-based local side id) cell data. 3D element
+faces become polygons; 2D element edges become line cells.
+
 ```python
 import exovista
 
 mesh = exovista.read_exo("output.exo")          # last time step
 mesh_t0 = exovista.read_exo("output.exo", time_step=1)  # first time step
+
+# Also reconstruct side sets
+mesh, side_sets = exovista.read_exo("output.exo", read_side_sets=True)
+top_faces = side_sets["side_0"]
 
 # Parallel decomposition (pass each part, or use exovista.File for globbing)
 joined = exovista.read_exo("run.exo.4.0", "run.exo.4.1",
