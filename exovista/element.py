@@ -55,8 +55,7 @@ class Quad4:
         - The result is the same as for subdiv with intervals=1.
 
         """
-        xc = np.average(self.coord[:, 0]) / 4.0
-        return np.append(xc, 0.0)
+        return np.average(self.coord, axis=0)
 
     def subdiv(self, intervals):
         """Compute an equispaced subdivision of a quad4 element.
@@ -617,7 +616,7 @@ class Tri3:
 
             # split it
             mp = _midpoint(coord[longi1], coord[longi2])
-            coord = np.row_stack((coord, mp))
+            coord = np.vstack((coord, mp))
             mpnode = len(coord) - 1
             # replace it with the two new tets
             newtris.append([longi1, mpnode, i3])
@@ -739,7 +738,7 @@ class Tet4:
                         i4 = a
             # split it
             mp = _midpoint(coord[longi1], coord[longi2])
-            coord = np.row_stack((coord, mp))
+            coord = np.vstack((coord, mp))
             mpnode = len(coord) - 1
             # replace it with the two new tets
             newtets.append([longi1, mpnode, i3, i4])
@@ -888,7 +887,7 @@ class Wedge6:
             mpvm = _midpoint(mpbtri, mpttri)
 
             old_max = len(coord)
-            coord = np.row_stack(
+            coord = np.vstack(
                 (
                     coord,
                     mpbtri,  # old_max+1
