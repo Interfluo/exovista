@@ -789,9 +789,11 @@ class parallel_exodusii_file(exodusii_file):
             for (i, dist_fact) in enumerate(file_local_ns_df):
                 gid = node_map[(fid, file_local_ns_nodes[i])]
                 ns_dist_facts[mapping[gid]] = dist_fact
+        # When no constituent file stores distribution factors the node set has
+        # none; return None to match the serial reader. Cache the value that is
+        # actually returned so repeated calls (e.g. num_node_set_dist_fact and
+        # get_node_set) stay consistent.
         cache[set_id] = ns_dist_facts
-        if ns_dist_facts is None:
-            return np.ones(len(mapping))
         return ns_dist_facts
 
     def get_node_set_ids(self):

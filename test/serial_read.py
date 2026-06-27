@@ -5,18 +5,18 @@ import numpy as np
 import exovista
 
 
-def test_exodusii_read_0(datadir):
+def test_exodusii_read_0(datafile):
 
-    noh = os.path.join(datadir, "noh.exo")
+    noh = datafile("noh.exo")
     exof = exovista.File(noh)
     assert exof.filename == noh
     assert exof.title() == "PAMGEN Inline Mesh"
     exof.close()
 
 
-def test_exodusii_read_1(datadir):
+def test_exodusii_read_1(datafile):
 
-    noh = os.path.join(datadir, "noh.exo")
+    noh = datafile("noh.exo")
     exof = exovista.File(noh)
     assert exof.num_dimensions() == 2
     assert exof.storage_type() == "d"
@@ -551,8 +551,8 @@ def test_exodusii_read_mkmesh(datadir):
     exof.close()
 
 
-def test_exodusii_allclose(datadir):
-    noh = os.path.join(datadir, "noh.exo")
+def test_exodusii_allclose(datafile):
+    noh = datafile("noh.exo")
     f1 = exovista.exo_file(noh)
     f2 = exovista.exo_file(noh)
     assert exovista.allclose(f1, f2)

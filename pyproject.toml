@@ -5,7 +5,7 @@ description = "Python wrappers to the ExodusII finite element database model"
 dependencies = ["netcdf4", "pyvista", "numpy", "scipy"]
 
 [project.scripts]
-"exoread.py" = "exodusii:exoread"
+"exoread.py" = "exovista:exoread"
 
 [build-system]
 requires = ["setuptools>=64", "setuptools-scm[toml]>=6.2.3"]
