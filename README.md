@@ -14,6 +14,7 @@ An extension of the Sandia exodusii library for exporting PyVista meshes to Exod
 - **Time-Varying Fields**: Write a time history of node and element results (transient data)
 - **Compressed Output**: Array data is zlib/deflate compressed by default (netCDF4), dramatically shrinking file size
 - **Named Blocks/Sets**: Optionally provide custom names for element blocks and side sets
+- **Read Back to PyVista**: Load an Exodus file straight into a PyVista `UnstructuredGrid` with `read_exo` (inverse of `write_exo`)
 
 ## Installation
 
@@ -113,6 +114,49 @@ exovista.write_exo(
 For a single time step a 1D array (length `n_nodes` or `n_cells`) is also
 accepted. The resulting file animates over time in ParaView.
 
+### `exovista.read_exo`
+
+The inverse of `write_exo`: load an ExodusII database into a PyVista
+`UnstructuredGrid`.
+
+```python
+read_exo(
+    filename: str,
+    *files: str,
+    time_step: int = -1,
+    read_node_variables: bool = True,
+    read_element_variables: bool = True,
+) -> pv.UnstructuredGrid
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filename` | `str` | Input Exodus file path |
+| `*files` | `str` | Additional file parts of a parallel decomposition |
+| `time_step` | `int` | 1-based time step to sample variables at; negative indexes from the end (`-1` = last step) |
+| `read_node_variables` | `bool` | Load node variables into `point_data` |
+| `read_element_variables` | `bool` | Load element variables into `cell_data` |
+
+The returned grid reconstructs node coordinates (2D meshes are embedded in 3D
+with `z = 0`) and all element blocks, concatenated in block order. Each cell
+records its originating Exodus block via `cell_data["exo_block_id"]` and
+`cell_data["exo_block_name"]`. Node and element variables are sampled at the
+requested `time_step`, and the full time history is available in
+`grid.field_data["times"]` (`grid.field_data["num_dim"]` holds the original
+spatial dimension).
+
+```python
+import exovista
+
+mesh = exovista.read_exo("output.exo")          # last time step
+mesh_t0 = exovista.read_exo("output.exo", time_step=1)  # first time step
+
+# Parallel decomposition (pass each part, or use exovista.File for globbing)
+joined = exovista.read_exo("run.exo.4.0", "run.exo.4.1",
+                           "run.exo.4.2", "run.exo.4.3")
+```
+
 ### Output Compression
 
 When writing netCDF4 files (the default), array variables are stored with
@@ -139,6 +183,7 @@ Example scripts are located in the `examples/` directory:
 | `example_side_sets.py` | 3D Tet mesh with side sets |
 | `example_mixed_elements.py` | Mixed Hex and Tet elements |
 | `example_time_fields.py` | Time-varying node and element fields (transient data) |
+| `example_read_exo.py` | Round-trip: write a mesh then read it back with `read_exo` |
 | `save_exo.py` | Comprehensive example with multiple mesh types |
 
 Run an example:
@@ -149,11 +194,16 @@ python examples/example_2d_quads.py
 ## Development
 
 ### Running Tests
+The test suite uses `pytest`:
 ```shell
-PYTHONPATH=. python test/test_2d_save.py
-PYTHONPATH=. python test/test_write_exo.py
-PYTHONPATH=. python test/test_connectivity.py
+pip install -e . pytest
+pytest test/
 ```
+
+Tests that depend on upstream ExodusII reference files not redistributed with
+this fork (e.g. `noh.exo`, `edges.base.exo`) are skipped automatically when the
+files are absent. Continuous integration runs `flake8` and the full test suite
+across Python 3.10–3.12 (see `.github/workflows/ci.yml`).
 
 ### Cleaning Generated Files
 ```shell
