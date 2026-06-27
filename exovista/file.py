@@ -750,7 +750,7 @@ class exodusii_file:
             number of attributes per edge
         """
         if block_id not in self.get_edge_block_ids():
-            raise None
+            raise ValueError(f"{block_id} is not a valid edge block ID")
         elem_type = self.get_edge_block_elem_type(block_id)
         if elem_type is None:
             return None
@@ -1190,7 +1190,7 @@ class exodusii_file:
             number of attributes per element
         """
         if block_id not in self.get_element_block_ids():
-            raise None
+            raise ValueError(f"{block_id} is not a valid element block ID")
         elem_type = self.get_element_block_elem_type(block_id)
         if elem_type is None:
             return None
@@ -1564,7 +1564,7 @@ class exodusii_file:
             number of attributes per face
         """
         if block_id not in self.get_face_block_ids():
-            raise None
+            raise ValueError(f"{block_id} is not a valid face block ID")
         elem_type = self.get_face_block_elem_type(block_id)
         if elem_type is None:
             return None

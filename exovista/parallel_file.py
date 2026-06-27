@@ -354,7 +354,7 @@ class parallel_exodusii_file(exodusii_file):
             number of attributes per element
         """
         if block_id not in self.get_element_block_ids():
-            raise None
+            raise ValueError(f"{block_id} is not a valid element block ID")
         for (fid, file) in enumerate(self.files):
             block_iid = self.f_get_element_block_iid(file, block_id)
             if not self.elem_block_is_active(file, block_iid):
@@ -621,7 +621,7 @@ class parallel_exodusii_file(exodusii_file):
             number of attributes per face
         """
         if block_id not in self.get_face_block_ids():
-            raise None
+            raise ValueError(f"{block_id} is not a valid face block ID")
         for (fid, file) in enumerate(self.files):
             block_iid = self.f_get_face_block_iid(file, block_id)
             if not self.face_block_is_active(file, block_iid):

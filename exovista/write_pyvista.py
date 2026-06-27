@@ -446,6 +446,14 @@ def write_exo(filename,
     f = open(filename, "w+")
     f.close()
 
+    # Work on shallow copies so the helper arrays we attach (orig_pts,
+    # orig_cell_ids, surface cell/face/block ids, and a default region key)
+    # never leak back onto the caller's meshes. A shallow copy shares the
+    # underlying point/cell arrays, so this is cheap.
+    volume = volume.copy(deep=False)
+    if surface is not None:
+        surface = surface.copy(deep=False)
+
     # Process meshes
     volume.point_data["orig_pts"] = np.arange(volume.n_points)
     volume.cell_data["orig_cell_ids"] = np.arange(volume.n_cells)
