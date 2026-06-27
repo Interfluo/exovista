@@ -43,7 +43,7 @@ def similar(file1, file2, times=None):
     ):
         raise ValueError("Files do not define the same element variables")
 
-    if not np.allclose(file1.get_element_block_ids(), file1.get_element_block_ids()):
+    if not np.allclose(file1.get_element_block_ids(), file2.get_element_block_ids()):
         raise ValueError("Files do not define the same element block IDs")
 
     for block_id in file1.get_element_block_ids():
