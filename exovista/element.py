@@ -607,11 +607,11 @@ class Tri3:
             longi2 = 0
             i3 = 0
             for idx in range(-1, len(tri) - 1):
-                ds = _distsquare(coord[idx], coord[idx+1])
+                ds = _distsquare(coord[idx], coord[idx + 1])
                 if ds > longest:
                     longest = ds
                     longi1 = tri[idx]
-                    longi2 = tri[idx+1]
+                    longi2 = tri[idx + 1]
 
             i3 = (set(tri) - set((longi1, longi2))).pop()
 

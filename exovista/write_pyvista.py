@@ -48,7 +48,8 @@ vtk2exo_faceorder = {
 }
 
 # Mapping for node permutation when converting VTK cell to Exodus cell
-# Some VTK cells (like VOXEL, PIXEL) have different node ordering than their Exodus counterparts
+# Some VTK cells (like VOXEL, PIXEL) have different node ordering than their
+# Exodus counterparts
 vtk2exo_permute = {
     pv.CellType.PIXEL: [0, 1, 3, 2],  # Pixel -> Quad
     pv.CellType.VOXEL: [0, 1, 3, 2, 4, 5, 7, 6],  # Voxel -> Hex
@@ -154,7 +155,9 @@ def _compute_face_centers_vectorized(coords, connectivity, cell_type):
     return all_centers.reshape(-1, 3)
 
 
-def _get_block_face_info_vectorized(coords, connectivity, cell_ids, cell_type, block_id):
+def _get_block_face_info_vectorized(
+    coords, connectivity, cell_ids, cell_type, block_id
+):
     """
     Compute face center info for a block, returning arrays instead of PolyData.
 
@@ -194,7 +197,11 @@ def _get_block_face_info_vectorized(coords, connectivity, cell_ids, cell_type, b
     return centers, face_cell_ids, face_ids, block_ids
 
 
-def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key: str = "region") -> tuple[dict, pv.MultiBlock]:
+def process_meshes(
+    volume: pv.UnstructuredGrid,
+    surface: pv.PolyData,
+    region_key: str = "region",
+) -> tuple[dict, pv.MultiBlock]:
     """
     Process volume and surface meshes to prepare for ExodusII export.
 
@@ -217,7 +224,10 @@ def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key
     """
     # Check and fallback for volume regions
     if region_key not in volume.cell_data:
-        logging.warning(f"Region key '{region_key}' not found in volume cell data. Setting all regions to 1.")
+        logging.warning(
+            f"Region key '{region_key}' not found in volume cell data. "
+            "Setting all regions to 1."
+        )
         volume.cell_data[region_key] = np.ones(volume.n_cells, dtype=int)
 
     volume_regions = np.unique(volume[region_key])
@@ -225,7 +235,10 @@ def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key
 
     if surface is not None:
         if region_key not in surface.cell_data:
-            logging.warning(f"Region key '{region_key}' not found in surface cell data. Setting all regions to 1.")
+            logging.warning(
+                f"Region key '{region_key}' not found in surface cell data. "
+                "Setting all regions to 1."
+            )
             surface.cell_data[region_key] = np.ones(surface.n_cells, dtype=int)
         surface_regions = np.unique(surface[region_key])
         logging.info(f"Surface regions found: {surface_regions}")
@@ -240,17 +253,24 @@ def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key
     for ct_value in unique_cell_types:
         cell_type = pv.CellType(ct_value)
         if cell_type not in vtk2exo:
-            logging.warning(f"Unsupported cell type {cell_type.name} ({ct_value}). Skipping.")
+            logging.warning(
+                f"Unsupported cell type {cell_type.name} ({ct_value}). Skipping."
+            )
             continue
 
         volume_cell_type = volume.extract_cells_by_type(cell_type)
         if volume_cell_type.n_cells == 0:
             continue
 
-        logging.info(f"Processing cell type: {cell_type.name} with {volume_cell_type.n_cells} cells")
+        logging.info(
+            f"Processing cell type: {cell_type.name} "
+            f"with {volume_cell_type.n_cells} cells"
+        )
         for m in volume_cell_type.split_values(scalars=region_key):
             region_value = m[region_key][0] if region_key in m.cell_data else 1
-            logging.info(f"  - Sub-block with region {region_value} and {m.n_cells} cells")
+            logging.info(
+                f"  - Sub-block with region {region_value} and {m.n_cells} cells"
+            )
             volume_blocks[counter] = {
                 "region": region_value,
                 "cell_type": cell_type,
@@ -292,7 +312,9 @@ def process_meshes(volume: pv.UnstructuredGrid, surface: pv.PolyData, region_key
         all_face_ids = np.concatenate(all_face_ids)
         all_block_ids = np.concatenate(all_block_ids)
 
-        logging.info(f"Generated {len(all_centers)} face center points for interpolation.")
+        logging.info(
+            f"Generated {len(all_centers)} face center points for interpolation."
+        )
 
         # Single KD-tree query for all surface cell centers
         tree = cKDTree(all_centers)
@@ -390,7 +412,8 @@ def write_exo(filename,
     region_key : str, optional
         The name of the cell data array defining regions (default is "region").
     block_names: list[str], optional
-        list of names for the element blocks, default naming is ["block_0", "block_1" ...]
+        list of names for the element blocks, default naming is
+        ["block_0", "block_1" ...]
     side_set_names: list[str], optional
         list of names for the side sets, default naming is ["set_0", "set_1" ...]
     save_node_arrays: bool = True,
@@ -438,7 +461,10 @@ def write_exo(filename,
     if side_set_names is None:
         side_set_names = [f"side_{i}" for i in range(n_side_sets)]
 
-    logging.info(f"Element blocks: {n_element_blocks}, Side sets: {n_side_sets}, Nodes: {n_nodes}, Cells: {n_cells}")
+    logging.info(
+        f"Element blocks: {n_element_blocks}, Side sets: {n_side_sets}, "
+        f"Nodes: {n_nodes}, Cells: {n_cells}"
+    )
     if n_element_blocks == 0:
         logging.warning("No element blocks to write. File may be empty or invalid.")
     if n_side_sets == 0:
@@ -453,16 +479,23 @@ def write_exo(filename,
     else:
         n_steps = 1
     node_fields = _validate_time_fields(node_fields, n_steps, n_nodes, "node")
-    element_fields = _validate_time_fields(element_fields, n_steps, n_cells, "element")
+    element_fields = _validate_time_fields(
+        element_fields, n_steps, n_cells, "element"
+    )
     has_time_data = bool(node_fields) or bool(element_fields) or times is not None
     if has_time_data:
-        logging.info(f"Writing {n_steps} time step(s): "
-                     f"{len(node_fields)} node field(s), {len(element_fields)} element field(s).")
+        logging.info(
+            f"Writing {n_steps} time step(s): {len(node_fields)} node field(s), "
+            f"{len(element_fields)} element field(s)."
+        )
 
     # Write exodus file
     with exodusii_file(filename, mode="w") as exof:
-        exof.put_init(title="pyvista_mesh", num_dim=3, num_nodes=n_nodes, num_elem=n_cells,
-                      num_elem_blk=n_element_blocks, num_side_sets=n_side_sets, num_node_sets=0)
+        exof.put_init(
+            title="pyvista_mesh", num_dim=3, num_nodes=n_nodes, num_elem=n_cells,
+            num_elem_blk=n_element_blocks, num_side_sets=n_side_sets,
+            num_node_sets=0,
+        )
         exof.put_coords(np.array(volume.points))
         logging.info("Initialized ExodusII file and wrote coordinates.")
 
@@ -473,23 +506,36 @@ def write_exo(filename,
             mesh = item["mesh"]
             n_block_cells = mesh.n_cells
             if n_block_cells == 0:
-                logging.warning(f"Skipping empty block {key} with region {item['region']}")
+                logging.warning(
+                    f"Skipping empty block {key} with region {item['region']}"
+                )
                 continue
             n_cell_nodes = mesh.get_cell(0).n_points
             exo_cell_type = vtk2exo[item["cell_type"]]
             if exo_cell_type is None:
-                logging.warning(f"Unsupported cell type {item['cell_type'].name} in block {key}. Skipping.")
+                logging.warning(
+                    f"Unsupported cell type {item['cell_type'].name} "
+                    f"in block {key}. Skipping."
+                )
                 continue
-            logging.info(f"  - Block {counter}: {exo_cell_type} with {n_block_cells} cells, region {item['region']}")
-            connectivity = mesh['orig_pts'][mesh.cells.reshape(-1, n_cell_nodes+1)[:, 1:]] + 1
+            logging.info(
+                f"  - Block {counter}: {exo_cell_type} with {n_block_cells} "
+                f"cells, region {item['region']}"
+            )
+            connectivity = (
+                mesh['orig_pts'][mesh.cells.reshape(-1, n_cell_nodes + 1)[:, 1:]] + 1
+            )
 
             # Apply permutation if needed (e.g. VOXEL -> HEX)
             if item["cell_type"] in vtk2exo_permute:
                 perm = vtk2exo_permute[item["cell_type"]]
                 connectivity = connectivity[:, perm]
-            exof.put_element_block(counter, elem_type=exo_cell_type, num_block_elems=n_block_cells, num_nodes_per_elem=n_cell_nodes)
+            exof.put_element_block(
+                counter, elem_type=exo_cell_type,
+                num_block_elems=n_block_cells, num_nodes_per_elem=n_cell_nodes,
+            )
             exof.put_element_conn(counter, connectivity)
-            exof.put_element_block_name(counter, block_names[counter-1])
+            exof.put_element_block_name(counter, block_names[counter - 1])
             # Record the Exodus block ID so time-varying element fields can be
             # mapped back to this block later.
             item["exo_block_id"] = counter
@@ -557,9 +603,9 @@ def write_exo(filename,
                 logging.warning(f"Skipping empty side set {i}")
                 continue
             logging.info(f"  - Side set {i} with {n_sides} sides")
-            exof.put_side_set_param(i+1, n_sides)
-            exof.put_side_set_sides(i+1, s["cell_ids"]+1, s["face_ids"]+1)
-            exof.put_side_set_name(i+1, side_set_names[i])
+            exof.put_side_set_param(i + 1, n_sides)
+            exof.put_side_set_sides(i + 1, s["cell_ids"] + 1, s["face_ids"] + 1)
+            exof.put_side_set_name(i + 1, side_set_names[i])
 
         exof.close()
         logging.info(f"{filename} saved successfully.")
