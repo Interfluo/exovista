@@ -21,6 +21,7 @@ from .lineout import lineout
 from .find_in_region import find_element_data_in_region, find_node_data_in_region
 from .exoread import main as exoread
 from .write_pyvista import write_exo
+from .read_pyvista import read_exo
 
 __all__ = [
     # Core file operations
@@ -41,8 +42,9 @@ __all__ = [
     "find_node_data_in_region",
     # CLI
     "exoread",
-    # PyVista export
+    # PyVista export / import
     "write_exo",
+    "read_exo",
 ]
 
 def File(filename, *files, mode="r"):

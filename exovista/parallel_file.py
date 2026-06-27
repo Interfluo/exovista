@@ -354,7 +354,7 @@ class parallel_exodusii_file(exodusii_file):
             number of attributes per element
         """
         if block_id not in self.get_element_block_ids():
-            raise None
+            raise ValueError(f"{block_id} is not a valid element block ID")
         for (fid, file) in enumerate(self.files):
             block_iid = self.f_get_element_block_iid(file, block_id)
             if not self.elem_block_is_active(file, block_iid):
@@ -621,7 +621,7 @@ class parallel_exodusii_file(exodusii_file):
             number of attributes per face
         """
         if block_id not in self.get_face_block_ids():
-            raise None
+            raise ValueError(f"{block_id} is not a valid face block ID")
         for (fid, file) in enumerate(self.files):
             block_iid = self.f_get_face_block_iid(file, block_id)
             if not self.face_block_is_active(file, block_iid):
@@ -789,9 +789,11 @@ class parallel_exodusii_file(exodusii_file):
             for (i, dist_fact) in enumerate(file_local_ns_df):
                 gid = node_map[(fid, file_local_ns_nodes[i])]
                 ns_dist_facts[mapping[gid]] = dist_fact
+        # When no constituent file stores distribution factors the node set has
+        # none; return None to match the serial reader. Cache the value that is
+        # actually returned so repeated calls (e.g. num_node_set_dist_fact and
+        # get_node_set) stay consistent.
         cache[set_id] = ns_dist_facts
-        if ns_dist_facts is None:
-            return np.ones(len(mapping))
         return ns_dist_facts
 
     def get_node_set_ids(self):

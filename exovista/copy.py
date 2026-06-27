@@ -188,10 +188,10 @@ def copy_variable_histories(source, target):
     if copy_extra_set_info:
         for set_id in source.get_node_set_ids():
             for name in source.get_node_set_variable_names():
-                values = source.get_node_set_variable_values(block_id, name)
-                target.put_node_set_variable_values(None, block_id, name, values)
+                values = source.get_node_set_variable_values(set_id, name)
+                target.put_node_set_variable_values(None, set_id, name, values)
 
         for set_id in source.get_side_set_ids():
             for name in source.get_side_set_variable_names():
-                values = source.get_side_set_variable_values(block_id, name)
-                target.put_side_set_variable_values(None, block_id, name, values)
+                values = source.get_side_set_variable_values(set_id, name)
+                target.put_side_set_variable_values(None, set_id, name, values)

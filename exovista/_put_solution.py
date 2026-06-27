@@ -1,9 +1,16 @@
+# NOTE: Legacy/dead code inherited from the upstream fork. It is not wired into
+# the package (nothing imports it) and is currently broken: it calls
+# ``exo.createVariable`` (not a method on ExodusIIFile), never writes
+# coordinates or connectivity, and references several ``ex.*`` constants that do
+# not exist in this exodus_h. Kept private (leading underscore) for reference
+# until it is either fully reimplemented or removed. See README / v2 notes.
+
 import numpy as np
 from .file import ExodusIIFile
 from . import exodus_h as ex
 
 
-def put_nodal_solution(filename, nodmap, elemap, coord, elecon, elem_blocks, u):
+def _put_nodal_solution(filename, nodmap, elemap, coord, elecon, elem_blocks, u):
 
     exo = ExodusIIFile(filename, mode="w")
     fh = exo.fh

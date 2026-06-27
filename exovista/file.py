@@ -750,7 +750,7 @@ class exodusii_file:
             number of attributes per edge
         """
         if block_id not in self.get_edge_block_ids():
-            raise None
+            raise ValueError(f"{block_id} is not a valid edge block ID")
         elem_type = self.get_edge_block_elem_type(block_id)
         if elem_type is None:
             return None
@@ -1190,7 +1190,7 @@ class exodusii_file:
             number of attributes per element
         """
         if block_id not in self.get_element_block_ids():
-            raise None
+            raise ValueError(f"{block_id} is not a valid element block ID")
         elem_type = self.get_element_block_elem_type(block_id)
         if elem_type is None:
             return None
@@ -1564,7 +1564,7 @@ class exodusii_file:
             number of attributes per face
         """
         if block_id not in self.get_face_block_ids():
-            raise None
+            raise ValueError(f"{block_id} is not a valid face block ID")
         elem_type = self.get_face_block_elem_type(block_id)
         if elem_type is None:
             return None
@@ -3358,14 +3358,14 @@ class exodusii_file:
         Returns
         -------
         elem_blk_names : list<string>
-        
+
         """
         names = ["{0:{1}s}".format(x, 32)[:32] for x in names]
         block_ids = self.get_element_block_ids()
 
         for (block_id, name) in zip(block_ids, names):
             block_iid = self.get_element_block_iid(block_id)
-            self.fill_variable(ex.VAR_NAME_ELEM_BLK, block_iid-1, name)
+            self.fill_variable(ex.VAR_NAME_ELEM_BLK, block_iid - 1, name)
 
     @requires_write_mode
     def put_element_block_name(self, block_id, name):
@@ -3376,11 +3376,11 @@ class exodusii_file:
         block_id : ex_entity_id
             element block *ID* (not *INDEX*)
         name : string
-        
+
         """
         name = "{0:{1}s}".format(name, 32)[:32]
         block_iid = self.get_element_block_iid(block_id)
-        self.fill_variable(ex.VAR_NAME_ELEM_BLK, block_iid-1, name)
+        self.fill_variable(ex.VAR_NAME_ELEM_BLK, block_iid - 1, name)
 
     @requires_write_mode
     def put_element_conn(self, block_id, connect, type=ex.types.node):

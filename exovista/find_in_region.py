@@ -105,7 +105,7 @@ def find_node_data_in_region(
                 xd.append(elem_data[ix])
             xd = np.column_stack(xd)
             if cycle in data:
-                data[cycle] = np.row_stack((data[cycle], xd))
+                data[cycle] = np.vstack((data[cycle], xd))
             else:
                 data[cycle] = xd
 
@@ -230,7 +230,7 @@ def find_element_data_in_region(
                     xd.append(elem_data[ix])
                 xd = np.column_stack(xd)
                 if cycle in data:
-                    data[cycle] = np.row_stack((data[cycle], xd))
+                    data[cycle] = np.vstack((data[cycle], xd))
                 else:
                     data[cycle] = xd
 
