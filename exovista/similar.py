@@ -65,6 +65,11 @@ def similar(file1, file2, times=None):
 
 
 def compare_varnames(arg1, arg2):
+    # NOTE: This intentionally checks that every name in ``arg1`` is present in
+    # ``arg2`` (subset), not that the two name sets are equal. ``arg2`` may
+    # therefore define additional variables and still be considered "similar".
+    # Left as-is by design; tighten to a symmetric comparison if strict
+    # equality is ever required.
     if arg1 is None and arg2 is None:
         return True
     elif arg1 is None and arg2 is not None:
