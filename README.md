@@ -135,9 +135,9 @@ read_exo(
 |-----------|------|-------------|
 | `filename` | `str` | Input Exodus file path |
 | `*files` | `str` | Additional file parts of a parallel decomposition |
-| `time_step` | `int` | 1-based time step to sample variables at; negative indexes from the end (`-1` = last step) |
-| `read_node_variables` | `bool` | Load node variables into `point_data` |
-| `read_element_variables` | `bool` | Load element variables into `cell_data` |
+| `time_step` | `int` | 1-based time step to sample variables at; negative indexes from the end (`-1` = last, `-2` = second-to-last). `0` is invalid and raises `IndexError` |
+| `read_node_variables` | `bool \| str \| list[str]` | Node variables to load into `point_data`: `True` (all), `False` (none), or a name / list of names |
+| `read_element_variables` | `bool \| str \| list[str]` | Element variables to load into `cell_data`; same semantics as `read_node_variables` |
 | `read_side_sets` | `bool` | Also reconstruct side sets and return them alongside the grid |
 
 The returned grid reconstructs node coordinates (2D meshes are embedded in 3D
@@ -160,6 +160,10 @@ import exovista
 mesh = exovista.read_exo("output.exo")          # last time step
 mesh_t0 = exovista.read_exo("output.exo", time_step=1)  # first time step
 
+# Load only the variables you need (skips reading the rest)
+mesh = exovista.read_exo("output.exo", read_node_variables="temperature",
+                         read_element_variables=False)
+
 # Also reconstruct side sets
 mesh, side_sets = exovista.read_exo("output.exo", read_side_sets=True)
 top_faces = side_sets["side_0"]
@@ -167,6 +171,37 @@ top_faces = side_sets["side_0"]
 # Parallel decomposition (pass each part, or use exovista.File for globbing)
 joined = exovista.read_exo("run.exo.4.0", "run.exo.4.1",
                            "run.exo.4.2", "run.exo.4.3")
+```
+
+### `exovista.read_node_fields` / `exovista.read_element_fields`
+
+The inverses of `write_exo`'s `node_fields` / `element_fields` arguments. They
+return the **full time history** of the requested variables as a dict, *without*
+rebuilding the mesh — the lightweight way to pull a transient field's history
+out of a file.
+
+```python
+read_node_fields(filename: str, *files: str,
+                 names: str | list[str] | None = None) -> dict[str, np.ndarray]
+read_element_fields(filename: str, *files: str,
+                    names: str | list[str] | None = None) -> dict[str, np.ndarray]
+```
+
+`names=None` (default) reads every variable; pass a name or list to read a
+subset. Unknown names raise `KeyError`. Each value has shape
+`(num_times, num_nodes)` (or `(num_times, num_elems)`) — the same layout
+`write_exo` accepts. Element variables are concatenated in block-id order,
+NaN-padding any block on which a variable is not defined.
+
+```python
+import exovista
+
+# Whole history of every node field, no mesh reconstruction
+node_fields = exovista.read_node_fields("output.exo")
+temperature = node_fields["temperature"]   # shape (num_times, num_nodes)
+
+# Just one element field
+pressure = exovista.read_element_fields("output.exo", names="pressure")["pressure"]
 ```
 
 ### Output Compression

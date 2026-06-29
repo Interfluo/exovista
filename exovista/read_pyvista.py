@@ -89,10 +89,14 @@ def read_exo(filename, *files, time_step=-1, read_node_variables=True,
         1-based time step at which to sample node/element variables. Negative
         values index from the end, so the default ``-1`` selects the last step.
         Ignored when the file has no variables.
-    read_node_variables : bool, optional
-        If True (default) node variables are loaded into ``grid.point_data``.
-    read_element_variables : bool, optional
-        If True (default) element variables are loaded into ``grid.cell_data``.
+    read_node_variables : bool, str, or list of str, optional
+        Which node variables to load into ``grid.point_data``. ``True``
+        (default) loads all, ``False`` loads none, and a name or list of names
+        loads only those variables (useful to avoid reading fields you do not
+        need). Unknown names raise ``KeyError``.
+    read_element_variables : bool, str, or list of str, optional
+        Which element variables to load into ``grid.cell_data``. Same
+        semantics as ``read_node_variables``.
     read_side_sets : bool, optional
         If True, also reconstruct side sets as surface geometry and return them
         alongside the volume mesh. Default is False.
@@ -203,10 +207,12 @@ def _build_grid(f, points, blocks, time_step,
     grid.field_data["num_dim"] = np.array([f.num_dimensions()])
 
     if read_node_variables:
-        _read_node_variables(f, grid, time_step)
+        _read_node_variables(f, grid, time_step, select=read_node_variables)
     if read_element_variables and cells:
         ordered_blocks = [(b["id"], b["conn"].shape[0]) for b in blocks]
-        _read_element_variables(f, grid, time_step, ordered_blocks)
+        _read_element_variables(
+            f, grid, time_step, ordered_blocks, select=read_element_variables
+        )
 
     return grid
 
@@ -285,10 +291,30 @@ def _faces_to_polydata(points, faces, face_lengths):
     return pv.PolyData(points, **kwargs)
 
 
-def _read_node_variables(f, grid, time_step):
-    names = f.get_node_variable_names()
-    if names is None:
-        return
+def _normalize_selection(select, available):
+    """Resolve a ``True``/``False``/``str``/list selection of variable names.
+
+    ``True`` selects every available name, ``False``/``None`` selects nothing,
+    and a name or iterable of names selects exactly those (preserving the
+    caller's order). Names not present in ``available`` raise ``KeyError`` so a
+    typo fails loudly instead of silently reading nothing.
+    """
+    available = [] if available is None else [str(n) for n in available]
+    if select is True:
+        return available
+    if select is False or select is None:
+        return []
+    requested = [select] if isinstance(select, str) else [str(n) for n in select]
+    missing = [n for n in requested if n not in available]
+    if missing:
+        raise KeyError(
+            f"Variable(s) {missing} not found; available names are {available}"
+        )
+    return requested
+
+
+def _read_node_variables(f, grid, time_step, select=True):
+    names = _normalize_selection(select, f.get_node_variable_names())
     for name in names:
         values = f.get_node_variable_values(name, time_step=time_step)
         if values is None:
@@ -298,10 +324,8 @@ def _read_node_variables(f, grid, time_step):
             grid.point_data[str(name)] = values
 
 
-def _read_element_variables(f, grid, time_step, ordered_blocks):
-    names = f.get_element_variable_names()
-    if names is None:
-        return
+def _read_element_variables(f, grid, time_step, ordered_blocks, select=True):
+    names = _normalize_selection(select, f.get_element_variable_names())
     for name in names:
         chunks = []
         for block_id, n_block_cells in ordered_blocks:
@@ -318,3 +342,104 @@ def _read_element_variables(f, grid, time_step, ordered_blocks):
             combined = np.concatenate(chunks)
             if combined.shape[0] == grid.n_cells:
                 grid.cell_data[str(name)] = combined
+
+
+def read_node_fields(filename, *files, names=None):
+    """Read node-variable time histories from an Exodus file.
+
+    Inverse of the ``node_fields`` argument to :func:`exovista.write_exo`. The
+    mesh (coordinates, connectivity) is *not* reconstructed, so this is the
+    lightweight way to pull a transient field's full history out of a file.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the ExodusII file. For a parallel decomposition pass the
+        remaining parts as additional positional arguments.
+    *files : str
+        Additional file parts of a parallel decomposition.
+    names : str or list of str, optional
+        Name or list of names to read. ``None`` (default) reads every node
+        variable. Unknown names raise ``KeyError``.
+
+    Returns
+    -------
+    dict of {str: ndarray}
+        Maps each variable name to an array of shape ``(num_times, num_nodes)``
+        -- the same layout :func:`write_exo` accepts in ``node_fields``.
+    """
+    f = _open(filename, *files)
+    try:
+        select = True if names is None else names
+        wanted = _normalize_selection(select, f.get_node_variable_names())
+        out = {}
+        for name in wanted:
+            values = f.get_node_variable_values(name, time_step=None)
+            if values is not None:
+                out[str(name)] = np.asarray(values)
+        return out
+    finally:
+        f.close()
+
+
+def read_element_fields(filename, *files, names=None):
+    """Read element-variable time histories from an Exodus file.
+
+    Inverse of the ``element_fields`` argument to :func:`exovista.write_exo`.
+    Element variables are stored per block with a truth table, so blocks are
+    concatenated in block-id order (NaN-padding any block on which a variable
+    is not defined) to reconstruct the global element ordering that
+    :func:`write_exo` accepted. The mesh itself is not reconstructed.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the ExodusII file. For a parallel decomposition pass the
+        remaining parts as additional positional arguments.
+    *files : str
+        Additional file parts of a parallel decomposition.
+    names : str or list of str, optional
+        Name or list of names to read. ``None`` (default) reads every element
+        variable. Unknown names raise ``KeyError``.
+
+    Returns
+    -------
+    dict of {str: ndarray}
+        Maps each variable name to an array of shape ``(num_times, num_elems)``
+        -- the same layout :func:`write_exo` accepts in ``element_fields``.
+    """
+    f = _open(filename, *files)
+    try:
+        select = True if names is None else names
+        wanted = _normalize_selection(select, f.get_element_variable_names())
+        if not wanted:
+            return {}
+
+        block_ids = f.get_element_block_ids()
+        block_ids = [] if block_ids is None else list(block_ids)
+        block_sizes = []
+        for block_id in block_ids:
+            block = f.get_element_block(block_id)
+            block_sizes.append(0 if block is None else block.num_block_elems)
+        num_times = f.num_times()
+
+        out = {}
+        for name in wanted:
+            chunks = []
+            for block_id, n_block_cells in zip(block_ids, block_sizes):
+                if n_block_cells == 0:
+                    continue
+                values = f.get_element_variable_values(
+                    block_id, name, time_step=None
+                )
+                if values is None:
+                    # Not defined on this block (truth table); pad with NaN so
+                    # the columns stay aligned with the global element order.
+                    chunks.append(np.full((num_times, n_block_cells), np.nan))
+                else:
+                    chunks.append(np.asarray(values, dtype=float))
+            if chunks:
+                out[str(name)] = np.concatenate(chunks, axis=1)
+        return out
+    finally:
+        f.close()
