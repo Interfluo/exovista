@@ -23,6 +23,25 @@ def requires_write_mode(fun):
     return inner
 
 
+def _select_time_step(values, time_step):
+    """Index a per-time-step ``values`` array by a 1-based ``time_step``.
+
+    Time steps are 1-based: ``1`` is the first step, ``2`` the second, and so
+    on. Negative values index from the end Python-style, so ``-1`` is the last
+    step and ``-2`` the second-to-last. ``time_step=0`` has no meaning under
+    1-based indexing and raises ``IndexError`` rather than silently returning
+    the last step.
+    """
+    if time_step == 0:
+        raise IndexError(
+            "time_step is 1-based; use 1 for the first step or -1 for the "
+            "last. 0 is not a valid time step."
+        )
+    if time_step > 0:
+        return values[time_step - 1]
+    return values[time_step]
+
+
 class exodusii_file:
     """
     A file object for Exodus data.
@@ -559,7 +578,7 @@ class exodusii_file:
             return None
         if time_step is None:
             return values
-        return values[time_step - 1]
+        return _select_time_step(values, time_step)
 
     def get_all_node_set_params(self):
         """Get total number of nodes and distribution factors (e.g. nodal
@@ -1081,9 +1100,7 @@ class exodusii_file:
             return None
         if time_step is None:
             return values
-        elif time_step < 0:
-            time_step = len(values)
-        return values[time_step - 1]
+        return _select_time_step(values, time_step)
 
     def get_edge_variable_values_across_blocks(self, var_name, time_step):
         values = []
@@ -1484,9 +1501,7 @@ class exodusii_file:
             return None
         if time_step is None:
             return values
-        elif time_step < 0:
-            time_step = len(values)
-        return values[time_step - 1]
+        return _select_time_step(values, time_step)
 
     def get_element_variable_values_across_blocks(self, var_name, time_step=None):
         values = []
@@ -1872,9 +1887,7 @@ class exodusii_file:
             return None
         if time_step is None:
             return values
-        elif time_step < 0:
-            time_step = len(values)
-        return values[time_step - 1]
+        return _select_time_step(values, time_step)
 
     def get_face_variable_values_across_blocks(self, var_name, time_step):
         values = []
@@ -1924,7 +1937,7 @@ class exodusii_file:
         gvar_val : float
         """
         values = self.get_global_variable_values(var_name)
-        return values[time_step - 1]
+        return _select_time_step(values, time_step)
 
     def get_global_variable_values(self, var_name):
         """Get global variable values over all time steps for one global variable
@@ -2252,9 +2265,7 @@ class exodusii_file:
             return None
         if time_step is None:
             return values
-        elif time_step < 0:
-            return values[-1]
-        return values[time_step - 1]
+        return _select_time_step(values, time_step)
 
     def get_qa_records(self):
         """Get a list of QA records where each QA record is a length-4 tuple of
@@ -2594,9 +2605,7 @@ class exodusii_file:
             return None
         if time_step is None:
             return values
-        elif time_step < 0:
-            time_step = len(values)
-        return values[time_step - 1]
+        return _select_time_step(values, time_step)
 
     @requires_write_mode
     def initw(self):

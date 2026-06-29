@@ -71,6 +71,96 @@ class TestTimeFields(unittest.TestCase):
         finally:
             f.close()
 
+    def test_time_step_indexing(self):
+        # 1-based positive, Python-style negative-from-end, and 0 is invalid.
+        times = np.array([0.0, 0.5, 1.0])
+        temperature = np.array([t * self.points[:, 0] for t in times])
+        pressure = np.array([[t, 2 * t] for t in times])
+        out = os.path.join(self.test_dir, "indexing.exo")
+        exovista.write_exo(
+            out, self.grid, times=times,
+            node_fields={"temperature": temperature},
+            element_fields={"pressure": pressure},
+        )
+        f = exovista.File(out, mode="r")
+        try:
+            # Positive: 1 -> first step.
+            np.testing.assert_allclose(
+                f.get_node_variable_values("temperature", time_step=1),
+                temperature[0],
+            )
+            # Negative indexes from the end: -1 last, -2 second-to-last.
+            np.testing.assert_allclose(
+                f.get_node_variable_values("temperature", time_step=-1),
+                temperature[2],
+            )
+            np.testing.assert_allclose(
+                f.get_node_variable_values("temperature", time_step=-2),
+                temperature[1],
+            )
+            block_ids = list(f.get_element_block_ids())
+            np.testing.assert_allclose(
+                f.get_element_variable_values(block_ids[0], "pressure", time_step=-2),
+                [pressure[1, 0]],
+            )
+            # 0 is not a valid 1-based step: it must raise, not return the last.
+            with self.assertRaises(IndexError):
+                f.get_node_variable_values("temperature", time_step=0)
+            with self.assertRaises(IndexError):
+                f.get_element_variable_values(block_ids[0], "pressure", time_step=0)
+        finally:
+            f.close()
+
+    def test_read_field_mirror_functions(self):
+        times = np.array([0.0, 0.5, 1.0])
+        temperature = np.array([t * self.points[:, 0] for t in times])
+        pressure = np.array([[t, 2 * t] for t in times])
+        out = os.path.join(self.test_dir, "mirror.exo")
+        exovista.write_exo(
+            out, self.grid, times=times,
+            node_fields={"temperature": temperature},
+            element_fields={"pressure": pressure},
+        )
+
+        # Full time history, returned in the same layout write_exo accepted.
+        node_fields = exovista.read_node_fields(out)
+        np.testing.assert_allclose(node_fields["temperature"], temperature)
+        self.assertEqual(node_fields["temperature"].shape, temperature.shape)
+
+        elem_fields = exovista.read_element_fields(out)
+        np.testing.assert_allclose(elem_fields["pressure"], pressure)
+        self.assertEqual(elem_fields["pressure"].shape, pressure.shape)
+
+        # Name selection (str and list) and unknown-name errors.
+        self.assertEqual(
+            list(exovista.read_node_fields(out, names="temperature")),
+            ["temperature"],
+        )
+        self.assertEqual(
+            list(exovista.read_element_fields(out, names=["pressure"])),
+            ["pressure"],
+        )
+        with self.assertRaises(KeyError):
+            exovista.read_node_fields(out, names="missing")
+
+    def test_read_exo_variable_selection(self):
+        times = np.array([0.0, 1.0])
+        temperature = np.array([t * self.points[:, 0] for t in times])
+        pressure = np.array([[t, 2 * t] for t in times])
+        out = os.path.join(self.test_dir, "select.exo")
+        exovista.write_exo(
+            out, self.grid, times=times,
+            node_fields={"temperature": temperature},
+            element_fields={"pressure": pressure},
+        )
+        grid = exovista.read_exo(
+            out, read_node_variables="temperature", read_element_variables=False
+        )
+        self.assertIn("temperature", grid.point_data)
+        self.assertNotIn("pressure", grid.cell_data)
+        with self.assertRaises(KeyError):
+            exovista.read_exo(out, read_node_variables="missing")
+
     def test_single_step_1d_field(self):
         # A 1D field is accepted as a single time step.
         out = os.path.join(self.test_dir, "single_step.exo")
