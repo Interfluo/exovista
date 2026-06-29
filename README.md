@@ -231,6 +231,7 @@ Example scripts are located in the `examples/` directory:
 | `example_mixed_elements.py` | Mixed Hex and Tet elements |
 | `example_time_fields.py` | Time-varying node and element fields (transient data) |
 | `example_read_exo.py` | Round-trip: write a mesh then read it back with `read_exo` |
+| `example_read_field_history.py` | Read full field time histories with `read_node_fields` / `read_element_fields`, select variables, and `time_step` indexing |
 | `save_exo.py` | Comprehensive example with multiple mesh types |
 
 Run an example:
