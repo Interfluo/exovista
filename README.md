@@ -15,6 +15,7 @@ An extension of the Sandia exodusii library for exporting PyVista meshes to Exod
 - **Compressed Output**: Array data is zlib/deflate compressed by default (netCDF4), dramatically shrinking file size
 - **Named Blocks/Sets**: Optionally provide custom names for element blocks and side sets
 - **Read Back to PyVista**: Load an Exodus file straight into a PyVista `UnstructuredGrid` with `read_exo` (inverse of `write_exo`)
+- **Time Vector**: Pull a file's time steps on their own with `read_times`, no mesh reconstruction
 
 ## Installation
 
@@ -146,7 +147,8 @@ records its originating Exodus block via `cell_data["exo_block_id"]` and
 `cell_data["exo_block_name"]`. Node and element variables are sampled at the
 requested `time_step`, and the full time history is available in
 `grid.field_data["times"]` (`grid.field_data["num_dim"]` holds the original
-spatial dimension).
+spatial dimension). If the time vector is all you need, use
+[`read_times`](#exovistaread_times) instead of digging it out of `field_data`.
 
 When `read_side_sets=True`, a second value is returned: a `pv.MultiBlock` with
 one `pv.PolyData` per side set (named after the side set), whose faces are
@@ -172,6 +174,41 @@ top_faces = side_sets["side_0"]
 joined = exovista.read_exo("run.exo.4.0", "run.exo.4.1",
                            "run.exo.4.2", "run.exo.4.3")
 ```
+
+### `exovista.read_times`
+
+Returns the file's time vector on its own, without rebuilding the mesh.
+
+```python
+read_times(filename: str, *files: str) -> np.ndarray
+```
+
+```python
+import exovista
+
+times = exovista.read_times("output.exo")   # shape (num_times,), float64
+times[0]                                    # value of Exodus time step 1
+len(times)                                  # number of time steps
+
+# Parallel decomposition: pass each part, or glob via exovista.File
+times = exovista.read_times("run.exo.4.0", "run.exo.4.1",
+                            "run.exo.4.2", "run.exo.4.3")
+```
+
+The array is ordered as written and is empty for a static (mesh-only) file.
+Index it 0-based — `times[i]` is the value of the 1-based Exodus time step
+`i + 1`, which is the step number `read_exo`'s `time_step` argument expects.
+Pair it with `read_node_fields` / `read_element_fields` below, whose histories
+share this abscissa:
+
+```python
+times = exovista.read_times("output.exo")                       # (num_times,)
+temp = exovista.read_node_fields("output.exo")["temperature"]   # (num_times, num_nodes)
+```
+
+For finer-grained queries (a single time value, the nearest step to a target
+time) open the file and use `exovista.File(...).get_times()`, `.get_time(step)`,
+`.get_time_step(target)` and `.num_times()`.
 
 ### `exovista.read_node_fields` / `exovista.read_element_fields`
 
@@ -231,7 +268,7 @@ Example scripts are located in the `examples/` directory:
 | `example_mixed_elements.py` | Mixed Hex and Tet elements |
 | `example_time_fields.py` | Time-varying node and element fields (transient data) |
 | `example_read_exo.py` | Round-trip: write a mesh then read it back with `read_exo` |
-| `example_read_field_history.py` | Read full field time histories with `read_node_fields` / `read_element_fields`, select variables, and `time_step` indexing |
+| `example_read_field_history.py` | Read the time vector with `read_times` and full field time histories with `read_node_fields` / `read_element_fields`, select variables, and `time_step` indexing |
 | `save_exo.py` | Comprehensive example with multiple mesh types |
 
 Run an example:

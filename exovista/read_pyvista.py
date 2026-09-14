@@ -8,7 +8,8 @@ an ExodusII database into a :class:`pyvista.UnstructuredGrid`, reconstructing:
   block id and name recorded as cell data.
 - Node variables (point data) and element variables (cell data) sampled at a
   chosen time step.
-- The time history, exposed via ``grid.field_data["times"]``.
+- The time history, exposed via ``grid.field_data["times"]`` (or on its own,
+  without touching the mesh, via :func:`read_times`).
 
 It handles both serial files and globbed parallel decompositions through
 :func:`exovista.File`.
@@ -70,6 +71,12 @@ def _open(filename, *files):
     if files:
         return parallel_exodusii_file(filename, *files)
     return exodusii_file(filename, mode="r")
+
+
+def _times_array(f):
+    """Return an open file's time vector as a float array (empty if static)."""
+    times = f.get_times()
+    return np.asarray([]) if times is None else np.asarray(times, dtype=float)
 
 
 def read_exo(filename, *files, time_step=-1, read_node_variables=True,
@@ -201,9 +208,7 @@ def _build_grid(f, points, blocks, time_step,
             np.empty(0, dtype=np.int64), np.empty(0, dtype=np.uint8), points
         )
 
-    times = f.get_times()
-    times = np.asarray([]) if times is None else np.asarray(times, dtype=float)
-    grid.field_data["times"] = times
+    grid.field_data["times"] = _times_array(f)
     grid.field_data["num_dim"] = np.array([f.num_dimensions()])
 
     if read_node_variables:
@@ -342,6 +347,37 @@ def _read_element_variables(f, grid, time_step, ordered_blocks, select=True):
             combined = np.concatenate(chunks)
             if combined.shape[0] == grid.n_cells:
                 grid.cell_data[str(name)] = combined
+
+
+def read_times(filename, *files):
+    """Read the time vector from an Exodus file.
+
+    Inverse of the ``times`` argument to :func:`exovista.write_exo`, and the
+    companion abscissa for :func:`read_node_fields` / :func:`read_element_fields`.
+    The mesh is not reconstructed, so this is the cheap way to ask a file what
+    time steps it holds -- ``read_exo(...).field_data["times"]`` returns the
+    same vector but rebuilds the whole grid to do it.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the ExodusII file. For a parallel decomposition pass the
+        remaining parts as additional positional arguments.
+    *files : str
+        Additional file parts of a parallel decomposition.
+
+    Returns
+    -------
+    ndarray
+        The time values, shape ``(num_times,)`` and dtype ``float64``, ordered
+        as written. Empty for a static (mesh-only) file. Index it 0-based:
+        ``times[0]`` is the value of Exodus time step 1.
+    """
+    f = _open(filename, *files)
+    try:
+        return _times_array(f)
+    finally:
+        f.close()
 
 
 def read_node_fields(filename, *files, names=None):

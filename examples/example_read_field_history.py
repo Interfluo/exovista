@@ -3,8 +3,9 @@
 Example of reading time-history fields back out of an ExodusII file.
 
 This demonstrates the lightweight read counterparts to ``write_exo``'s
-``node_fields`` / ``element_fields`` arguments:
+``times`` / ``node_fields`` / ``element_fields`` arguments:
 
+    - ``read_times``          -> ndarray of shape (num_times,)
     - ``read_node_fields``    -> dict of {name: (num_times, num_nodes)}
     - ``read_element_fields`` -> dict of {name: (num_times, num_elems)}
 
@@ -45,6 +46,12 @@ def main():
     )
 
     # --- Full time history, no mesh reconstruction ---------------------------
+    # The time vector on its own; the abscissa for the field histories below.
+    file_times = exovista.read_times(filename)
+    logging.info(f"times: {file_times} ({len(file_times)} steps)")
+    logging.info(f"times round-trip matches write: "
+                 f"{np.allclose(file_times, times)}")
+
     node_fields = exovista.read_node_fields(filename)
     elem_fields = exovista.read_element_fields(filename)
     temp_hist = node_fields["temperature"]   # (num_times, num_nodes)

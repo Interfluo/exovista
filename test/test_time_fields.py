@@ -143,6 +143,42 @@ class TestTimeFields(unittest.TestCase):
         with self.assertRaises(KeyError):
             exovista.read_node_fields(out, names="missing")
 
+    def test_read_times(self):
+        times = np.array([0.0, 0.5, 1.0])
+        temperature = np.array([t * self.points[:, 0] for t in times])
+        out = os.path.join(self.test_dir, "times.exo")
+        exovista.write_exo(
+            out, self.grid, times=times,
+            node_fields={"temperature": temperature},
+        )
+
+        read_times = exovista.read_times(out)
+        np.testing.assert_allclose(read_times, times)
+        self.assertEqual(read_times.shape, times.shape)
+        self.assertEqual(read_times.dtype, np.dtype(float))
+
+        # Same vector read_exo exposes as field data, without the mesh rebuild.
+        np.testing.assert_allclose(
+            read_times, exovista.read_exo(out).field_data["times"]
+        )
+
+        # times[i] is the value of the 1-based Exodus step i + 1.
+        f = exovista.File(out, mode="r")
+        try:
+            self.assertEqual(len(read_times), f.num_times())
+            for i, t in enumerate(read_times):
+                self.assertAlmostEqual(t, f.get_time(i + 1))
+        finally:
+            f.close()
+
+    def test_read_times_static_file(self):
+        # A mesh-only file has no time history: empty array, not an error.
+        out = os.path.join(self.test_dir, "static.exo")
+        exovista.write_exo(out, self.grid, save_node_arrays=False)
+        read_times = exovista.read_times(out)
+        self.assertEqual(read_times.shape, (0,))
+        self.assertEqual(read_times.dtype, np.dtype(float))
+
     def test_read_exo_variable_selection(self):
         times = np.array([0.0, 1.0])
         temperature = np.array([t * self.points[:, 0] for t in times])

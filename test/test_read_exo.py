@@ -119,6 +119,17 @@ class TestReadExo:
         assert grid.field_data["times"].size == 0
         assert grid.n_cells == vol.n_cells
 
+    def test_read_times_parallel_decomposition(self, datafile):
+        parts = [datafile(f"edges.exo.4.{i}") for i in range(4)]
+        times = exovista.read_times(*parts)
+        f = exovista.File(*parts)
+        try:
+            expected = np.asarray(f.get_times(), dtype=float)
+        finally:
+            f.close()
+        assert times.shape == expected.shape
+        np.testing.assert_allclose(times, expected)
+
     def test_side_set_reconstruction_3d(self, tmp_path):
         from scipy.spatial import cKDTree
 
