@@ -1,37 +1,89 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "exovista"
-version = "1.3.0"
-description = "Export and import PyVista meshes to and from the ExodusII finite element database format"
+version = "2.0.0"
+description = "Write PyVista meshes to ExodusII — element blocks, side sets, node sets and time-varying fields — and read them back"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "BSD-2-Clause-Views"
+license-files = ["LICENSE"]
 authors = [{ name = "Interfluo" }]
-keywords = ["exodus", "exodusii", "pyvista", "vtk", "finite-element", "mesh"]
-dependencies = ["netcdf4", "pyvista", "numpy", "scipy"]
+maintainers = [{ name = "Bijective Systems" }]
+keywords = [
+    "exodus",
+    "exodusii",
+    "exodus-ii",
+    "pyvista",
+    "vtk",
+    "finite-element",
+    "fem",
+    "mesh",
+    "netcdf",
+    "sideset",
+    "nodeset",
+    "moose",
+    "seacas",
+    "cubit",
+    "simulation",
+]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Typing :: Typed",
+]
+# Lower bounds: the oldest releases the full test suite passes with, verified
+# together on Python 3.10 (the "oldest-deps" CI job installs exactly these).
+# numpy 1.21.3, scipy 1.7.2 and netCDF4 1.5.8 are also the oldest releases with
+# Python 3.10 wheels.  PyVista 0.49 is the first release the suite's VTK oracles
+# run on (pv.PExodusIIReader, mesh validation); mesh.save("x.exo") needs the
+# pyvista.writers registry of PyVista >= 0.48.  No upper caps.
+dependencies = [
+    "numpy>=1.21.3",
+    "scipy>=1.7.2",
+    "netCDF4>=1.5.8",
+    "pyvista>=0.49",
 ]
 
-[project.urls]
-Homepage = "https://github.com/Interfluo/exovista"
-Repository = "https://github.com/Interfluo/exovista"
-
 [project.optional-dependencies]
-dev = ["pytest", "flake8"]
+test = ["pytest>=7", "meshio>=5.3"]
+dev = ["exovista[test]", "flake8>=7", "build>=1", "twine>=6.1"]
+
+[project.urls]
+Homepage = "https://github.com/bijective-systems-org/exovista"
+Repository = "https://github.com/bijective-systems-org/exovista"
+Issues = "https://github.com/bijective-systems-org/exovista/issues"
+Changelog = "https://github.com/bijective-systems-org/exovista/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/bijective-systems-org/exovista#readme"
 
 [project.scripts]
-"exoread.py" = "exovista:exoread"
+exovista-read = "exovista.exoread:main"
 
-[tool.setuptools]
-packages = ["exovista"]
+# ``mesh.save("model.exo")`` through PyVista's writer registry (``.g`` is BYU
+# in PyVista, so it is not claimed).
+[project.entry-points."pyvista.writers"]
+".exo" = "exovista._pyvista_plugin:save_exodus"
+".e" = "exovista._pyvista_plugin:save_exodus"
+".ex2" = "exovista._pyvista_plugin:save_exodus"
+".exii" = "exovista._pyvista_plugin:save_exodus"
+".gen" = "exovista._pyvista_plugin:save_exodus"
 
-[build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+[tool.setuptools.packages.find]
+include = ["exovista", "exovista.*"]
+
+[tool.setuptools.package-data]
+exovista = ["py.typed"]

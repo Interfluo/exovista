@@ -4,7 +4,7 @@ import os
 import numpy as np
 import pytest
 
-import exovista
+import exovista.legacy
 
 pv = pytest.importorskip("pyvista")
 
@@ -28,7 +28,7 @@ def test_write_exo_does_not_mutate_input(tmp_path):
     assert "orig_pts" not in vol.point_data
     assert "orig_cell_ids" not in vol.cell_data
     # ... nor into the file (1.x wrote an 'orig_pts' node variable).
-    with exovista.File(os.path.join(tmp_path, "x.exo")) as exof:
+    with exovista.legacy.File(os.path.join(tmp_path, "x.exo")) as exof:
         for names in (exof.get_node_variable_names(),
                       exof.get_element_variable_names()):
             assert names is None or len(names) == 0
@@ -48,7 +48,7 @@ def test_invalid_block_id_raises_valueerror(tmp_path):
     path = os.path.join(tmp_path, "z.exo")
     exovista.write_exo(path, vol, region_key="region")
 
-    with exovista.File(path) as exof:
+    with exovista.legacy.File(path) as exof:
         valid = exof.get_element_block_ids().tolist()
         bad_id = max(valid) + 1000
         with pytest.raises(ValueError):

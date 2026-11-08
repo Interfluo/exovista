@@ -40,7 +40,7 @@ def export_tetra_mesh() -> None:
     volume.points -= volume.center
     volume["tag"] = 1 * (volume.cell_centers().points[:, 0] > 0)
 
-    surface = volume.extract_surface()
+    surface = volume.extract_surface(algorithm=None)
     surface["tag"] = 1 * (surface.cell_centers().points[:, 2] > 0)
 
     exovista.write_exo("tetra.exo", volume, surface, region_key="tag")
@@ -59,7 +59,7 @@ def export_hex_mesh() -> None:
     volume = pv.CylinderStructured(
         radius=np.linspace(1, 2, 5)
     ).cast_to_unstructured_grid()
-    surface = volume.extract_surface()
+    surface = volume.extract_surface(algorithm=None)
 
     # Assign regions based on y and z coordinates
     volume["region"] = (
@@ -88,7 +88,7 @@ def export_hybrid() -> None:
             radius=np.linspace(1, 2, 5)
         ).cast_to_unstructured_grid(),
     })
-    surface = volume.combine().extract_surface()
+    surface = volume.combine().extract_surface(algorithm=None)
 
     exovista.write_exo("hybrid.exo", volume, surface)
     logging.info("Saved hybrid.exo")
@@ -109,7 +109,7 @@ def export_with_node_arrays() -> None:
         theta_resolution=32,
         z_resolution=10
     ).cast_to_unstructured_grid()
-    surface = volume.extract_surface()
+    surface = volume.extract_surface(algorithm=None)
 
     # Assign regions
     volume["region"] = (

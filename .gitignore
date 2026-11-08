@@ -1,14 +1,21 @@
-*.pyc
-__pycache__
+*.py[cod]
+__pycache__/
 .cache
+.pytest_cache/
 .coverage
 htmlcov
-*.bak
 
-# Ignore personal settings
+# Build and packaging artefacts
+/build/
+/dist/
+*.egg-info/
+/.venv/
+/venv/
+constraints-oldest.txt
+
+# Editor and OS files
+*.bak
 .vscode
-.vscode/settings.json
-/exovista.egg-info
 /.idea
 .DS_Store
 

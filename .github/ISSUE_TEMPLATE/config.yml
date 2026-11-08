@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/bijective-systems-org/exovista#readme
+    about: Guides, API reference and limitations of exovista.
+  - name: Reading Exodus files with PyVista / VTK (not exovista)
+    url: https://github.com/pyvista/pyvista/discussions
+    about: Questions about pyvista.read or pv.ExodusIIReader that do not involve exovista.

@@ -1,3 +1,15 @@
+"""The ``exovista-read`` command: print ExodusII metadata or variable values.
+
+Run ``exovista-read --help`` for usage.  ``exovista-read model.exo`` prints a
+summary of the file; ``exovista-read -n temp -i -1 model.exo`` prints the node
+variable ``temp`` at the last time step.  A parallel decomposition is read by
+passing a glob pattern that matches all of its parts (quote it).
+
+This command was installed as ``exoread.py`` in exovista 1.x; it was renamed
+so that it no longer collides with the script of the upstream ``exodusii``
+package.
+"""
+
 import sys
 import glob
 import argparse
@@ -35,9 +47,16 @@ def main(argv=None, file=None):
     component of the vector.
     """
 
+    from . import __version__
+
     argv = argv or sys.argv[1:]
-    p = argparse.ArgumentParser(description=main.__doc__)
-    p.add_argument("-V", "--version", action="version", version="%(prog)s 3.0")
+    p = argparse.ArgumentParser(prog="exovista-read", description=main.__doc__)
+    p.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s (exovista {__version__})",
+    )
 
     g = p.add_mutually_exclusive_group()
     g.add_argument(

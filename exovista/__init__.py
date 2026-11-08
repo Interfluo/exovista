@@ -1,55 +1,48 @@
+"""exovista: write PyVista meshes to ExodusII and read them back.
+
+Element blocks, side sets, node sets and time-varying node, element and
+global fields are written with :func:`write_exo`; :func:`read_exo` and the
+``read_*`` helpers read ExodusII files (serial or parallel decompositions)
+back into PyVista objects and NumPy arrays without loss of precision.
+
+Installing exovista also registers a PyVista writer plugin
+(:mod:`exovista._pyvista_plugin`), so ``mesh.save("model.exo")`` writes an
+ExodusII file with :func:`write_exo` (extensions ``.exo``, ``.e``, ``.ex2``,
+``.exii`` and ``.gen``) and forwards its keyword arguments.
+
+The 1.x low-level file API (``File``, ``exodusii_file``, ``allclose``, ...)
+lives in :mod:`exovista.legacy`.  Accessing it from the top-level package
+still works but emits a :class:`DeprecationWarning`; it will be removed in
+exovista 3.0.
+
+(Not to be confused with NASA's ExoVista exoplanet-imaging package.)
 """
-ExoVista - PyVista to ExodusII Export Library.
 
-This library extends the Sandia exodusii library to provide a simple interface
-for exporting PyVista meshes to ExodusII format with user-defined element blocks
-and side sets.
+import logging as _logging
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _metadata_version
 
-Key Functions:
-    write_exo: Write PyVista meshes to ExodusII format
-    File: Open ExodusII files for reading or writing
-    allclose: Compare ExodusII files for numerical equality
-    similar: Compare ExodusII files for structural similarity
-"""
-
-from .file import exodusii_file, ExodusIIFile, write_globals
-from .parallel_file import parallel_exodusii_file, MFExodusIIFile
-from .allclose import allclose
-from .similar import similar
-from .extension import *  # noqa: F403
-from .lineout import lineout
-from .find_in_region import find_element_data_in_region, find_node_data_in_region
-from .exoread import main as exoread
-from .write_pyvista import write_exo
+from . import legacy as _legacy
 from .read_pyvista import (
-    read_exo,
-    read_side_sets,
-    read_node_sets,
-    read_node_fields,
     read_element_fields,
+    read_exo,
     read_global_fields,
+    read_node_fields,
+    read_node_sets,
+    read_side_sets,
 )
+from .write_pyvista import write_exo
+
+try:
+    __version__ = _metadata_version("exovista")
+except _PackageNotFoundError:  # running from a source tree that is not installed
+    __version__ = "0+unknown"
+
+# Library logging etiquette: never configure logging, only make sure the
+# package logger does not fall back to the "last resort" stderr handler.
+_logging.getLogger(__name__).addHandler(_logging.NullHandler())
 
 __all__ = [
-    # Core file operations
-    "File",
-    "exo_file",
-    "exodusii_file",
-    "ExodusIIFile",
-    "write_globals",
-    # Parallel file operations
-    "parallel_exodusii_file",
-    "MFExodusIIFile",
-    # Comparison utilities
-    "allclose",
-    "similar",
-    # Data extraction
-    "lineout",
-    "find_element_data_in_region",
-    "find_node_data_in_region",
-    # CLI
-    "exoread",
-    # PyVista export / import
     "write_exo",
     "read_exo",
     "read_side_sets",
@@ -57,39 +50,43 @@ __all__ = [
     "read_node_fields",
     "read_element_fields",
     "read_global_fields",
+    "__version__",
 ]
 
-def File(filename, *files, mode="r"):
-
-    if mode not in "rw":
-        raise ValueError(f"Invalid Exodus file mode {mode!r}")
-
-    if mode == "r":
-        files = _find_files(filename, *files)
-        if len(files) > 1:
-            f = parallel_exodusii_file(*files)
-        elif len(files) == 1:
-            f = exodusii_file(files[0], mode="r")
-        else:
-            raise ValueError("No files to open")
-    elif mode == "w":
-        if files:
-            raise TypeError(f"Exodus writer takes 1 file but {len(files)+1} were given")
-        f = exodusii_file(filename, mode="w")
-
-    return f
+#: Names of the 1.x top-level API that now live in :mod:`exovista.legacy`.
+_LEGACY_NAMES = frozenset(_legacy.__all__)
 
 
-exo_file = File
+def _unbind_shadowing_submodules():
+    """Let the deprecated legacy names reach ``__getattr__``.
+
+    ``allclose``, ``similar``, ``lineout`` and ``exoread`` are both legacy
+    names and submodule names.  Importing :mod:`exovista.legacy` imported
+    those submodules, which binds the *module* objects as attributes of this
+    package and would shadow the deprecated callables served by
+    ``__getattr__``.  Drop those bindings; the submodules stay importable
+    (they remain in ``sys.modules``, so ``import exovista.lineout`` does not
+    re-bind them).
+    """
+    namespace = globals()
+    for name in _LEGACY_NAMES.intersection(namespace):
+        del namespace[name]
 
 
-def _find_files(*files):
-    import glob
+_unbind_shadowing_submodules()
+del _unbind_shadowing_submodules
 
-    found = []
-    for file in files:
-        globbed_files = glob.glob(file)
-        if not globbed_files:
-            raise FileNotFoundError(file)
-        found.extend(globbed_files)
-    return found
+
+def __getattr__(name):
+    if name in _LEGACY_NAMES:
+        import warnings
+
+        warnings.warn(
+            f"exovista.{name} is deprecated and will be removed in exovista 3.0; "
+            f"import it from exovista.legacy instead "
+            f"(from exovista.legacy import {name})",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return getattr(_legacy, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

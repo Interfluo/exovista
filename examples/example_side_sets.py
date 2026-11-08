@@ -16,7 +16,7 @@ def main():
     tets = pv.ImageData(dimensions=(3, 3, 3)).cast_to_unstructured_grid().triangulate()
 
     # The top (z = 2) and bottom (z = 0) faces only, as two named side sets.
-    surface = tets.extract_surface()
+    surface = tets.extract_surface(algorithm=None)
     z = surface.cell_centers().points[:, 2]
     keep = np.flatnonzero((z > 1.9) | (z < 0.1))
     surface = surface.extract_cells(keep)

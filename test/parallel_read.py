@@ -3,14 +3,14 @@
 import os
 import glob
 import numpy as np
-import exovista
+import exovista.legacy
 from exovista.exodus_h import maps
 
 
 def test_exodusii_read_1(datadir):
 
     files = glob.glob(os.path.join(datadir, "noh.exo.?.?"))
-    exof = exovista.exo_file(*files)
+    exof = exovista.legacy.exo_file(*files)
     assert exof.num_dimensions() == 2
     assert exof.storage_type() == "d"
 
@@ -510,7 +510,7 @@ def test_exodusii_read_mkmesh(tmpdir, datadir):
     from exovista.util import working_dir
 
     with working_dir(tmpdir.strpath):
-        exof = exovista.exo_file(
+        exof = exovista.legacy.exo_file(
             os.path.join(datadir, "mkmesh.par.2.0"),
             os.path.join(datadir, "mkmesh.par.2.1"),
         )

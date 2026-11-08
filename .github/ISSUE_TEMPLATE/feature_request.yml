@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest something exovista should write, read or do differently.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check the README's "Limitations" section and the open issues
+        first; maybe it is already planned or explained there.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The workflow or file you need (e.g. "write element attributes for a MOOSE input", "read face blocks").
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?
+      description: The API or behaviour you have in mind. A code sketch is welcome.
+      render: python
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+      description: What you use today (VTK, meshio, SEACAS tools, ...) and where it falls short.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Which solver or tool will read the file, links to format documentation, sample files.

@@ -1,0 +1,97 @@
+name: Bug report
+description: Something in exovista is wrong (a crash, a wrong file, a wrong read).
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! A small script or file that shows the problem
+        is the fastest way to a fix. Please do not paste confidential data.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+      placeholder: |
+        write_exo raised ValueError for a mesh with ... / the side set "top" of the
+        written file holds faces of ... when opened in ParaView.
+    validations:
+      required: true
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: |
+        A short, self-contained script (build the mesh with PyVista, e.g.
+        `pv.ImageData(dimensions=(3, 3, 3)).cast_to_unstructured_grid()`,
+        then call exovista). For reading problems, attach the smallest
+        `.exo` file that shows them (zip it), or its `ncdump -h` header.
+      render: python
+      placeholder: |
+        import numpy as np
+        import pyvista as pv
+        import exovista
+
+        mesh = pv.ImageData(dimensions=(3, 3, 3)).cast_to_unstructured_grid()
+        exovista.write_exo("bug.exo", mesh)
+        print(exovista.read_exo("bug.exo"))
+    validations:
+      required: true
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Error message or output
+      description: The full traceback or the wrong output. This is formatted as code.
+      render: text
+  - type: textarea
+    id: vtk
+    attributes:
+      label: What does VTK's reader say?
+      description: |
+        Optional but very useful: does `pyvista.read("file.exo")` (VTK's
+        Exodus reader, as in ParaView) read the file correctly?
+  - type: input
+    id: exovista-version
+    attributes:
+      label: exovista version
+      description: "`python -c \"import exovista; print(exovista.__version__)\"`"
+      placeholder: "2.0.0"
+    validations:
+      required: true
+  - type: input
+    id: pyvista-version
+    attributes:
+      label: PyVista version
+      placeholder: "0.49.2"
+    validations:
+      required: true
+  - type: input
+    id: vtk-version
+    attributes:
+      label: VTK version
+      placeholder: "9.7.2"
+    validations:
+      required: true
+  - type: input
+    id: netcdf4-version
+    attributes:
+      label: netCDF4 version (and netCDF library version)
+      description: "`python -c \"import netCDF4; print(netCDF4.__version__, netCDF4.__netcdf4libversion__)\"`"
+      placeholder: "1.7.5 (netCDF 4.10.1)"
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version and operating system
+      placeholder: "Python 3.13, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Full environment report (optional)
+      description: |
+        Output of
+        `python -c "import pyvista; print(pyvista.Report(additional=['exovista', 'netCDF4', 'scipy'], gpu=False))"`
+      render: text

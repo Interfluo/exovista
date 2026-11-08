@@ -6,7 +6,7 @@ depend on any external/upstream serial reference files.
 import glob
 import os
 
-import exovista
+import exovista.legacy
 from exovista.util import working_dir
 
 
@@ -22,7 +22,7 @@ def test_node_set_dist_facts_consistent(datadir):
     ``num_dist_facts`` reported a non-zero count even though ``dist_facts`` was
     ``None``. That inconsistency crashed the join.
     """
-    exof = exovista.exo_file(*_noh_files(datadir))
+    exof = exovista.legacy.exo_file(*_noh_files(datadir))
     try:
         for ns in exof.node_sets():
             if ns.dist_facts is None:
@@ -40,7 +40,7 @@ def test_node_set_dist_facts_consistent(datadir):
 
 def test_parallel_join_roundtrip(tmpdir, datadir):
     """Joining the decomposed files yields a readable serial file."""
-    exof = exovista.exo_file(*_noh_files(datadir))
+    exof = exovista.legacy.exo_file(*_noh_files(datadir))
     expected = {
         "title": exof.title(),
         "num_dim": exof.num_dimensions(),
@@ -52,7 +52,7 @@ def test_parallel_join_roundtrip(tmpdir, datadir):
 
     with working_dir(tmpdir.strpath):
         joined_path = exof.write("noh.exo")
-        with exovista.File(joined_path) as joined:
+        with exovista.legacy.File(joined_path) as joined:
             assert joined.title() == expected["title"]
             assert joined.num_dimensions() == expected["num_dim"]
             assert joined.num_nodes() == expected["num_nodes"]

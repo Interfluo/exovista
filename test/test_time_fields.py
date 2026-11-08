@@ -1,6 +1,6 @@
 
 """Time-varying fields written by write_exo, read back through the legacy
-``exovista.File`` API (1-based / negative ``time_step``) and the 2.0 readers.
+``exovista.legacy.File`` API (1-based / negative ``time_step``) and the 2.0 readers.
 
 exovista 2.0 stores everything as float64, so values and times round-trip
 exactly (1.x stored float32), block ids are the region values, and a single
@@ -14,7 +14,7 @@ import unittest
 import numpy as np
 import pyvista as pv
 
-import exovista
+import exovista.legacy
 
 
 class TestTimeFields(unittest.TestCase):
@@ -53,7 +53,7 @@ class TestTimeFields(unittest.TestCase):
         )
         self.assertTrue(os.path.exists(out))
 
-        f = exovista.File(out, mode="r")
+        f = exovista.legacy.File(out, mode="r")
         try:
             self.assertEqual(f.num_times(), 3)
             np.testing.assert_array_equal(f.get_times(), times)
@@ -98,7 +98,7 @@ class TestTimeFields(unittest.TestCase):
             node_fields={"temperature": temperature},
             element_fields={"pressure": pressure},
         )
-        f = exovista.File(out, mode="r")
+        f = exovista.legacy.File(out, mode="r")
         try:
             # Positive: 1 -> first step.
             np.testing.assert_allclose(
@@ -193,7 +193,7 @@ class TestTimeFields(unittest.TestCase):
             out, self.grid,
             node_fields={"height": node_vals},
         )
-        f = exovista.File(out, mode="r")
+        f = exovista.legacy.File(out, mode="r")
         try:
             self.assertEqual(f.num_times(), 1)
             np.testing.assert_array_equal(f.get_times(), [0.0])

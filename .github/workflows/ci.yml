@@ -2,51 +2,123 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
-    branches: ["**"]
+  schedule:
+    # Weekly run against the latest releases of every dependency.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   lint:
     name: Lint (flake8)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
         with:
-          python-version: "3.11"
-      - name: Install flake8
-        run: python -m pip install --upgrade pip flake8
-      - name: Run flake8
-        run: flake8 exovista/
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install flake8
+      - run: flake8 exovista test examples docs
 
   test:
-    name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install system libraries for headless VTK/PyVista
+          allow-prereleases: true
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # Editable install: registers the exovista-read script and the
+      # pyvista.writers entry points that test_cli.py / test_plugin.py use.
+      # No display or xvfb is needed: nothing in the suite renders.
+      - name: Install exovista with test dependencies (latest releases)
+        run: python -m pip install --upgrade -e ".[test]"
+      - run: python -m pip list
+      - name: Run the test suite
+        run: python -m pytest test -p no:cacheprovider -q
+
+  oldest-deps:
+    name: Oldest supported dependencies (Python 3.10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Pin every runtime dependency to its declared lower bound
+        shell: python
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgl1 libxrender1 libxcursor1 libxft2 \
-            libxinerama1 xvfb
-      - name: Install package and test dependencies
+          import re
+
+          text = open("pyproject.toml", encoding="utf-8").read()
+          block = re.search(r"^dependencies = \[(.*?)^\]", text, re.M | re.S).group(1)
+          pins = re.findall(r'"([A-Za-z0-9_.-]+)>=([^",;\s]+)"', block)
+          assert pins, "no lower bounds found in [project].dependencies"
+          with open("constraints-oldest.txt", "w", encoding="utf-8") as fh:
+              fh.writelines(f"{name}=={version}\n" for name, version in pins)
+          print(open("constraints-oldest.txt", encoding="utf-8").read())
+      - name: Install exovista with the oldest dependencies
+        run: python -m pip install -c constraints-oldest.txt -e ".[test]"
+      - run: python -m pip list
+      - name: Run the test suite
+        run: python -m pytest test -p no:cacheprovider -q
+
+  package:
+    name: Build and test the wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Build sdist and wheel
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-          python -m pip install pytest
-      - name: Run tests
-        run: xvfb-run -a python -m pytest test/ -q
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - name: Run the test suite against the installed wheel
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install "$(ls dist/*.whl)[test]"
+          mkdir "$RUNNER_TEMP/suite"
+          cp -r test examples README.md "$RUNNER_TEMP/suite/"
+          cd "$RUNNER_TEMP/suite"
+          "$RUNNER_TEMP/venv/bin/python" -c "import exovista, sys; print(exovista.__version__, exovista.__file__); assert 'site-packages' in exovista.__file__"
+          "$RUNNER_TEMP/venv/bin/python" -m pytest test -p no:cacheprovider -q

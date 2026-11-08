@@ -388,7 +388,9 @@ def test_combine_components(tmp_path):
         assert pd[name].shape == (8,), name
         np.testing.assert_array_equal(pd[name], model.node_vars[name][0])
     np.testing.assert_array_equal(
-        pd["mixed"], np.c_[model.node_vars["mixed_X"][0], model.node_vars["mixed_Y"][0]])
+        pd["mixed"],
+        np.c_[model.node_vars["mixed_X"][0], model.node_vars["mixed_Y"][0]],
+    )
     assert sorted(pd.keys()) == sorted(list(arrays) + scalars + ["mixed"])
     # combined arrays sit where their first component was
     assert list(pd.keys())[:5] == ["vel", "uv", "sym", "four", "five"]

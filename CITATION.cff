@@ -1,0 +1,41 @@
+cff-version: 1.2.0
+message: "If you use exovista in your work, please cite it as below."
+title: "exovista: write PyVista meshes to ExodusII and read them back"
+abstract: >-
+  exovista writes PyVista meshes to the ExodusII finite-element format,
+  with element blocks, side sets matched from a boundary surface, node sets,
+  and static and time-varying node, element and global variables, and reads
+  ExodusII files (including parallel decompositions) back into PyVista
+  without loss of precision.
+type: software
+version: 2.0.0
+date-released: "2026-11-08"
+license: BSD-2-Clause-Views
+authors:
+  - alias: Interfluo
+  - name: Bijective Systems
+repository-code: "https://github.com/bijective-systems-org/exovista"
+url: "https://github.com/bijective-systems-org/exovista"
+keywords:
+  - exodus
+  - exodusii
+  - exodus-ii
+  - pyvista
+  - vtk
+  - finite element
+  - mesh
+  - netcdf
+  - side set
+  - node set
+  - seacas
+  - simulation
+references:
+  - type: software
+    title: exodusii
+    abstract: >-
+      Pure-Python ExodusII reader and writer from Sandia National
+      Laboratories, of which exovista started as a fork.
+    authors:
+      - name: "National Technology & Engineering Solutions of Sandia, LLC"
+    repository-code: "https://github.com/sandialabs/exodusii"
+    license: BSD-2-Clause-Views

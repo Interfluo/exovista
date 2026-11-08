@@ -1,0 +1,10 @@
+# Source distribution contents beyond the package itself (which setuptools
+# adds from pyproject.toml): the test suite with its reference ExodusII files
+# and the examples, so that the sdist can be tested by downstream packagers.
+graft test
+graft examples
+include CHANGELOG.md CITATION.cff CONTRIBUTING.md
+global-exclude *.py[cod] .DS_Store
+prune test/.pytest_cache
+prune test/__pycache__
+prune examples/__pycache__

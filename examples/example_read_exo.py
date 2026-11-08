@@ -21,7 +21,7 @@ def main():
         [grid.points[:, 1], -grid.points[:, 0], np.zeros(grid.n_points)])
 
     # The boundary faces, split into two side sets (top vs. the rest).
-    surface = grid.extract_surface()
+    surface = grid.extract_surface(algorithm=None)
     top = surface.cell_centers().points[:, 2] > 1.5
     surface.cell_data["region"] = np.where(top, 1, 2)
 
