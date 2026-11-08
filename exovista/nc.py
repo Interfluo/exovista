@@ -15,12 +15,6 @@ else:
         _netcdf4 = False
         from .netcdf import netcdf_file as Dataset
 
-if _netcdf4:
-    import warnings
-
-    # netCDF4 uses numpy.tostring, which is deprecated
-    warnings.filterwarnings("ignore")
-
 
 def library():
     return "netcdf4" if _netcdf4 else "netcdf"
@@ -110,7 +104,11 @@ def create_dimension(fh, name, value):
 
 
 def create_variable(fh, id, type, shape):
-    kind = {str: "c", int: "i", float: "f"}[type]
+    if type is float:
+        word_size = getattr(fh, "floating_point_word_size", 8)
+        kind = "f" if int(word_size) == 4 else "d"
+    else:
+        kind = {str: "c", int: "i"}[type]
     fh.createVariable(id, kind, shape, **_compression_kwds(fh, shape))
 
 

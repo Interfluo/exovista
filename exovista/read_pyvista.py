@@ -161,7 +161,7 @@ def _read_blocks(f):
         conn = conn.reshape(block.num_block_elems, block.num_elem_nodes) - 1
         blocks.append({
             "id": block_id,
-            "name": block.name,
+            "name": str(block.name),
             "vtk_type": _resolve_vtk_cell_type(block.elem_type),
             "conn": conn,
             "start": start,

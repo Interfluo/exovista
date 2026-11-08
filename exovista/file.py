@@ -6,6 +6,7 @@ from functools import wraps
 from types import SimpleNamespace
 
 from . import nc
+from .config import config
 from .util import stringify, streamify, find_index, check_bounds, find_nearest, contains
 from .ex_params import ex_init_params
 from .extension import compute_node_variable_values_at_element_center
@@ -40,6 +41,9 @@ def _select_time_step(values, time_step):
     if time_step > 0:
         return values[time_step - 1]
     return values[time_step]
+
+
+MAX_NAME_LENGTH = 256
 
 
 class exodusii_file:
@@ -2607,21 +2611,30 @@ class exodusii_file:
             return values
         return _select_time_step(values, time_step)
 
+    def _pad_name(self, name):
+        name = str(name)
+        if len(name) > MAX_NAME_LENGTH:
+            raise ValueError(f"name {name!r} exceeds {MAX_NAME_LENGTH} characters")
+        if len(name) > int(getattr(self.fh, "maximum_name_length", 32)):
+            self.setattr("maximum_name_length", len(name))
+        return name.ljust(MAX_NAME_LENGTH)
+
     @requires_write_mode
     def initw(self):
         version = 5.0300002
         self.setattr(ex.ATT_API_VERSION, version)
         self.setattr(ex.ATT_VERSION, version)
-        self.setattr(ex.ATT_FLT_WORDSIZE, 4)
+        self.setattr(ex.ATT_FLT_WORDSIZE, config.float_word_size)
         self.setattr(ex.ATT_FILESIZE, 1)
 
         self.create_dimension(ex.DIM_TIME, None)
         self.create_variable(ex.VAR_WHOLE_TIME, float, (ex.DIM_TIME,))
 
         # standard ExodusII dimensioning
-        self.create_dimension(ex.DIM_NAME, 32)
-        self.create_dimension(ex.DIM_STR, 32)
-        self.create_dimension(ex.DIM_LIN, 80)
+        self.create_dimension(ex.DIM_NAME, MAX_NAME_LENGTH)
+        self.create_dimension(ex.DIM_STR, 33)
+        self.create_dimension(ex.DIM_LIN, 81)
+        self.setattr("maximum_name_length", 32)
         self.create_dimension(ex.DIM_N4, 4)
 
         self._counter = {}
@@ -3028,7 +3041,7 @@ class exodusii_file:
         num_dim = self.get_dimension(ex.DIM_NUM_DIM)
         for i in range(num_dim):
             self.fill_variable(
-                ex.VAR_NAME_COORD, i, "{0:{1}s}".format(coord_names[i], 32)
+                ex.VAR_NAME_COORD, i, self._pad_name(coord_names[i])
             )
 
     @requires_write_mode
@@ -3087,8 +3100,8 @@ class exodusii_file:
             self.fill_variable(var, np.zeros(num_attr))
 
             var = ex.VAR_NAME_EDGE_BLK_ATTRIB(block_iid)
-            self.create_variable(var, str, (dims[1], ex.DIM_STR))
-            self.fill_variable(var, " " * 32)
+            self.create_variable(var, str, (dims[1], ex.DIM_NAME))
+            self.fill_variable(var, " " * MAX_NAME_LENGTH)
 
         self._counter[counter] += 1
 
@@ -3192,7 +3205,7 @@ class exodusii_file:
         The function put_edge_variable_params must be called before this function is
         invoked.
         """
-        names = ["{0:{1}s}".format(x, 32)[:32] for x in names]
+        names = [self._pad_name(x) for x in names]
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_EDGE_VAR, i, name)
 
@@ -3207,7 +3220,7 @@ class exodusii_file:
         """
         self.create_dimension(ex.DIM_NUM_EDGE_VAR, num_vars)
         self.create_variable(
-            ex.VAR_NAME_EDGE_VAR, str, (ex.DIM_NUM_EDGE_VAR, ex.DIM_STR)
+            ex.VAR_NAME_EDGE_VAR, str, (ex.DIM_NUM_EDGE_VAR, ex.DIM_NAME)
         )
         for block_id in self.get_edge_block_ids():
             block_iid = self.get_edge_block_iid(block_id)
@@ -3353,8 +3366,8 @@ class exodusii_file:
             self.fill_variable(var, np.zeros(num_attr))
 
             var = ex.VAR_NAME_ELEM_BLK_ATTRIB(block_iid)
-            self.create_variable(var, str, (dims[1], ex.DIM_STR))
-            self.fill_variable(var, " " * 32)
+            self.create_variable(var, str, (dims[1], ex.DIM_NAME))
+            self.fill_variable(var, " " * MAX_NAME_LENGTH)
 
         self._counter[counter] += 1
 
@@ -3369,7 +3382,7 @@ class exodusii_file:
         elem_blk_names : list<string>
 
         """
-        names = ["{0:{1}s}".format(x, 32)[:32] for x in names]
+        names = [self._pad_name(x) for x in names]
         block_ids = self.get_element_block_ids()
 
         for (block_id, name) in zip(block_ids, names):
@@ -3387,7 +3400,7 @@ class exodusii_file:
         name : string
 
         """
-        name = "{0:{1}s}".format(name, 32)[:32]
+        name = self._pad_name(name)
         block_iid = self.get_element_block_iid(block_id)
         self.fill_variable(ex.VAR_NAME_ELEM_BLK, block_iid - 1, name)
 
@@ -3501,7 +3514,7 @@ class exodusii_file:
         The function put_element_variable_params must be called before this function is
         invoked.
         """
-        names = ["{0:{1}s}".format(x, 32)[:32] for x in names]
+        names = [self._pad_name(x) for x in names]
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_ELEM_VAR, i, name)
 
@@ -3516,7 +3529,7 @@ class exodusii_file:
         """
         self.create_dimension(ex.DIM_NUM_ELEM_VAR, num_vars)
         self.create_variable(
-            ex.VAR_NAME_ELEM_VAR, str, (ex.DIM_NUM_ELEM_VAR, ex.DIM_STR)
+            ex.VAR_NAME_ELEM_VAR, str, (ex.DIM_NUM_ELEM_VAR, ex.DIM_NAME)
         )
         for block_id in self.get_element_block_ids():
             block_iid = self.get_element_block_iid(block_id)
@@ -3619,8 +3632,8 @@ class exodusii_file:
             self.fill_variable(var, np.zeros(num_attr))
 
             var = ex.VAR_NAME_FACE_BLK_ATTRIB(block_iid)
-            self.create_variable(var, str, (dims[1], ex.DIM_STR))
-            self.fill_variable(var, " " * 32)
+            self.create_variable(var, str, (dims[1], ex.DIM_NAME))
+            self.fill_variable(var, " " * MAX_NAME_LENGTH)
 
         self._counter[counter] += 1
 
@@ -3724,7 +3737,7 @@ class exodusii_file:
         The function put_face_variable_params must be called before this function is
         invoked.
         """
-        names = ["{0:{1}s}".format(x, 32)[:32] for x in names]
+        names = [self._pad_name(x) for x in names]
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_FACE_VAR, i, name)
 
@@ -3739,7 +3752,7 @@ class exodusii_file:
         """
         self.create_dimension(ex.DIM_NUM_FACE_VAR, num_vars)
         self.create_variable(
-            ex.VAR_NAME_FACE_VAR, str, (ex.DIM_NUM_FACE_VAR, ex.DIM_STR)
+            ex.VAR_NAME_FACE_VAR, str, (ex.DIM_NUM_FACE_VAR, ex.DIM_NAME)
         )
         for block_id in self.get_face_block_ids():
             block_iid = self.get_face_block_iid(block_id)
@@ -3796,7 +3809,7 @@ class exodusii_file:
         invoked.
         """
         for (i, name) in enumerate(names):
-            self.fill_variable(ex.VAR_NAME_GLO_VAR, i, "{0:{1}s}".format(name, 32))
+            self.fill_variable(ex.VAR_NAME_GLO_VAR, i, self._pad_name(name))
 
     @requires_write_mode
     def put_global_variable_params(self, num_vars):
@@ -3919,7 +3932,7 @@ class exodusii_file:
             self.allocate_face_blocks(num_face_blk)
 
         if num_nodes:
-            self.create_variable(ex.VAR_NAME_COORD, str, (ex.DIM_NUM_DIM, ex.DIM_STR))
+            self.create_variable(ex.VAR_NAME_COORD, str, (ex.DIM_NUM_DIM, ex.DIM_NAME))
             coords = (ex.VAR_COORD_X, ex.VAR_COORD_Y, ex.VAR_COORD_Z)
             for i in range(num_dim):
                 self.create_variable(coords[i], float, (ex.DIM_NUM_NODES,))
@@ -3949,8 +3962,8 @@ class exodusii_file:
         num_elem = self.get_dimension(ex.DIM_NUM_ELEM)
         if len(elem_map) > num_elem:
             raise ValueError("len(elem_map) > num_elem")
-        self.create_variable(ex.VAR_ELEM_MAP, int, (ex.DIM_NUM_ELEM,))
-        self.fill_variable(ex.VAR_ELEM_MAP, elem_map)
+        self.create_variable(ex.VAR_ELEM_MAP(1), int, (ex.DIM_NUM_ELEM,))
+        self.fill_variable(ex.VAR_ELEM_MAP(1), elem_map)
 
     @requires_write_mode
     def put_element_map(self, *args):
@@ -4029,7 +4042,7 @@ class exodusii_file:
         """
         if names is None:
             return
-        names = ["{0:{1}s}".format(x, 32)[:32] for x in names]
+        names = [self._pad_name(x) for x in names]
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_NODE_SET_VAR, i, name)
 
@@ -4044,9 +4057,9 @@ class exodusii_file:
         """
         if not num_vars:
             return
-        self.create_dimension(ex.DIM_NODE_SET_VAR, num_vars)
+        self.create_dimension(ex.DIM_NUM_NODE_SET_VAR, num_vars)
         self.create_variable(
-            ex.VAR_NAME_NODE_SET_VAR, str, (ex.DIM_NODE_SET_VAR, ex.DIM_STR)
+            ex.VAR_NAME_NODE_SET_VAR, str, (ex.DIM_NUM_NODE_SET_VAR, ex.DIM_NAME)
         )
         for set_id in self.get_node_set_ids():
             set_iid = self.get_node_set_iid(set_id)
@@ -4180,7 +4193,7 @@ class exodusii_file:
         The function put_node_variable_params must be called before this function is
         invoked.
         """
-        names = ["{0:{1}s}".format(x, 32)[:32] for x in names]
+        names = [self._pad_name(x) for x in names]
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_NODE_VAR, i, name)
 
@@ -4195,7 +4208,7 @@ class exodusii_file:
         """
         self.create_dimension(ex.DIM_NUM_NODE_VAR, num_vars)
         self.create_variable(
-            ex.VAR_NAME_NODE_VAR, str, (ex.DIM_NUM_NODE_VAR, ex.DIM_STR)
+            ex.VAR_NAME_NODE_VAR, str, (ex.DIM_NUM_NODE_VAR, ex.DIM_NAME)
         )
         for i in range(num_vars):
             self.create_variable(
@@ -4304,7 +4317,7 @@ class exodusii_file:
         name : str
             The side set name
         """
-        name = "{0:{1}s}".format(name, 32)[:32]
+        name = self._pad_name(name)
         set_ids = self.get_side_set_ids()
         set_iid = self.get_iid(set_ids, set_id)
         self.fill_variable(ex.VAR_NAME_SIDE_SET, set_iid - 1, name)
@@ -4386,7 +4399,7 @@ class exodusii_file:
         """
         if names is None:
             return
-        names = ["{0:{1}s}".format(x, 32)[:32] for x in names]
+        names = [self._pad_name(x) for x in names]
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_SIDE_SET_VAR, i, name)
 
@@ -4403,7 +4416,7 @@ class exodusii_file:
             return
         self.create_dimension(ex.DIM_NUM_SIDE_SET_VAR, num_vars)
         self.create_variable(
-            ex.VAR_NAME_SIDE_SET_VAR, str, (ex.DIM_NUM_SIDE_SET_VAR, ex.DIM_STR)
+            ex.VAR_NAME_SIDE_SET_VAR, str, (ex.DIM_NUM_SIDE_SET_VAR, ex.DIM_NAME)
         )
         for set_id in self.get_side_set_ids():
             set_iid = self.get_side_set_iid(set_id)
@@ -4486,9 +4499,9 @@ class exodusii_file:
         self.create_variable(ex.VAR_STAT_EDGE_BLK, int, (ex.DIM_NUM_EDGE_BLK,))
         self.fill_variable(ex.VAR_STAT_EDGE_BLK, status)
 
-        names = np.array([" " * 32 for _ in prop1])
+        names = np.array([" " * MAX_NAME_LENGTH for _ in prop1])
         self.create_variable(
-            ex.VAR_NAME_EDGE_BLK, str, (ex.DIM_NUM_EDGE_BLK, ex.DIM_STR)
+            ex.VAR_NAME_EDGE_BLK, str, (ex.DIM_NUM_EDGE_BLK, ex.DIM_NAME)
         )
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_EDGE_BLK, i, name)
@@ -4511,9 +4524,9 @@ class exodusii_file:
         self.create_variable(ex.VAR_STAT_ELEM_BLK, int, (ex.DIM_NUM_ELEM_BLK,))
         self.fill_variable(ex.VAR_STAT_ELEM_BLK, status)
 
-        names = np.array([" " * 32 for _ in prop1])
+        names = np.array([" " * MAX_NAME_LENGTH for _ in prop1])
         self.create_variable(
-            ex.VAR_NAME_ELEM_BLK, str, (ex.DIM_NUM_ELEM_BLK, ex.DIM_STR)
+            ex.VAR_NAME_ELEM_BLK, str, (ex.DIM_NUM_ELEM_BLK, ex.DIM_NAME)
         )
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_ELEM_BLK, i, name)
@@ -4536,9 +4549,9 @@ class exodusii_file:
         self.create_variable(ex.VAR_STAT_FACE_BLK, int, (ex.DIM_NUM_FACE_BLK,))
         self.fill_variable(ex.VAR_STAT_FACE_BLK, status)
 
-        names = np.array([" " * 32 for _ in prop1])
+        names = np.array([" " * MAX_NAME_LENGTH for _ in prop1])
         self.create_variable(
-            ex.VAR_NAME_FACE_BLK, str, (ex.DIM_NUM_FACE_BLK, ex.DIM_STR)
+            ex.VAR_NAME_FACE_BLK, str, (ex.DIM_NUM_FACE_BLK, ex.DIM_NAME)
         )
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_FACE_BLK, i, name)
@@ -4561,9 +4574,9 @@ class exodusii_file:
         self.create_variable(ex.VAR_NODE_SET_STAT, int, (ex.DIM_NUM_NODE_SET,))
         self.fill_variable(ex.VAR_NODE_SET_STAT, status)
 
-        names = np.array([" " * 32 for _ in prop1])
+        names = np.array([" " * MAX_NAME_LENGTH for _ in prop1])
         self.create_variable(
-            ex.VAR_NAME_NODE_SET, str, (ex.DIM_NUM_NODE_SET, ex.DIM_STR)
+            ex.VAR_NAME_NODE_SET, str, (ex.DIM_NUM_NODE_SET, ex.DIM_NAME)
         )
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_NODE_SET, i, name)
@@ -4586,9 +4599,9 @@ class exodusii_file:
         self.create_variable(ex.VAR_SIDE_SET_STAT, int, (ex.DIM_NUM_SIDE_SET,))
         self.fill_variable(ex.VAR_SIDE_SET_STAT, status)
 
-        names = np.array([" " * 32 for _ in prop1])
+        names = np.array([" " * MAX_NAME_LENGTH for _ in prop1])
         self.create_variable(
-            ex.VAR_NAME_SIDE_SET, str, (ex.DIM_NUM_SIDE_SET, ex.DIM_STR)
+            ex.VAR_NAME_SIDE_SET, str, (ex.DIM_NUM_SIDE_SET, ex.DIM_NAME)
         )
         for (i, name) in enumerate(names):
             self.fill_variable(ex.VAR_NAME_SIDE_SET, i, name)
@@ -4706,9 +4719,9 @@ def write_globals(data, times, title=None, filename="Globals.exo"):
     variables = []
     for variable in data:
         # Check that variables are 32 chars or less
-        if len(variable) > 32:
+        if len(variable) > MAX_NAME_LENGTH:
             raise ValueError(
-                f"Variable name {variable} exceeds the Exodus limit of 32 characters"
+                f"Variable name {variable} exceeds the Exodus limit of 256 characters"
             )
         else:
             variables.append(variable)

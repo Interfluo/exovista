@@ -365,6 +365,7 @@ class parallel_exodusii_file(exodusii_file):
                 fid=fid,
                 iid=block_iid,
                 elem_type=elem_type,
+                name=self.get_element_block_name(block_id),
                 num_block_elems=self.num_elems_in_blk(block_id),
                 num_elem_nodes=self._num_nodes_per_elem(file, block_iid),
                 num_elem_edges=self._num_edges_per_elem(file, block_iid),

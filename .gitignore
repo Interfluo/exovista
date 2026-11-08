@@ -14,3 +14,6 @@ htmlcov
 
 # Generated files
 *.exo
+
+# Reference ExodusII files used by the test suite
+!test/data/*.exo

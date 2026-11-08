@@ -42,10 +42,20 @@ from operator import mul
 import mmap as mm
 
 import numpy as np
-from numpy.compat import asbytes, asstr
 from numpy import fromstring, dtype, empty, array, asarray
 from numpy import little_endian as LITTLE_ENDIAN
 from functools import reduce
+
+
+def asbytes(s):
+    # Replacement for the removed ``numpy.compat.asbytes``
+    return s if isinstance(s, bytes) else str(s).encode('latin1')
+
+
+def asstr(s):
+    # Replacement for the removed ``numpy.compat.asstr``
+    return s.decode('latin1') if isinstance(s, bytes) else str(s)
+
 
 integer_types = (int,)
 text_type = str
