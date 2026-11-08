@@ -43,6 +43,53 @@ def _select_time_step(values, time_step):
     return values[time_step]
 
 
+def _time_step_index(time_step, num_steps):
+    """Resolve a 1-based (negative from the end) ``time_step`` to a 0-based index.
+
+    Same semantics as :func:`_select_time_step` (``0`` and out-of-range values
+    raise ``IndexError``), but without needing the values, so callers can read
+    just that slice of a netCDF variable.
+    """
+    time_step = int(time_step)
+    if time_step == 0:
+        raise IndexError(
+            "time_step is 1-based; use 1 for the first step or -1 for the "
+            "last. 0 is not a valid time step."
+        )
+    index = time_step - 1 if time_step > 0 else num_steps + time_step
+    if not 0 <= index < num_steps:
+        raise IndexError(
+            f"time_step {time_step} is out of range for {num_steps} time step(s)"
+        )
+    return index
+
+
+def _coords_from_file(fh, num_dim):
+    """Read nodal coordinates ``(num_nodes, num_dim)`` from a netCDF handle.
+
+    Handles both the per-direction ``coordx``/``coordy``/``coordz`` variables
+    and the combined ``coord`` ``(num_dim, num_nodes)`` variable (written by
+    older Exodus versions and by meshio).
+    """
+    names = (ex.VAR_COORD_X, ex.VAR_COORD_Y, ex.VAR_COORD_Z)[:num_dim]
+    if all(name in fh.variables for name in names):
+        return np.column_stack([nc.get_variable(fh, name) for name in names])
+    if ex.VAR_COORD in fh.variables:
+        coord = np.asarray(nc.get_variable(fh, ex.VAR_COORD))
+        return coord[:num_dim].T.copy()
+    num_nodes = nc.get_dimension(fh, ex.DIM_NUM_NODES, default=0)
+    if not num_nodes:
+        return np.zeros((0, num_dim))
+    raise ValueError(f"{nc.filename(fh)}: no nodal coordinate variables found")
+
+
+def _name_at(names, iid):
+    """Name at 1-based index ``iid``; "" when the file stores no names."""
+    if names is None or iid is None or not 0 < iid <= len(names):
+        return ""
+    return str(names[iid - 1])
+
+
 MAX_NAME_LENGTH = 256
 
 
@@ -66,6 +113,13 @@ class exodusii_file:
         string -> filename
     mode : {'r', 'w', 'a'}, optional
         read-write-append mode, default is 'r'
+    float_word_size : {4, 8}, optional
+        Word size of floating point data written in mode 'w'. Defaults to the
+        ``EXODUSII_FLOAT_WORD_SIZE`` environment setting (8, i.e. float64).
+    compression_level : int, optional
+        Deflate level 0-9 for array variables written in mode 'w' (0 disables
+        compression). Defaults to the ``EXODUSII_COMPRESSION_LEVEL``
+        environment setting (1).
 
     Notes
     -----
@@ -89,8 +143,23 @@ class exodusii_file:
 
     """  # noqa: E501
 
-    def __init__(self, filename, mode="r"):
-        assert mode in "raw"
+    def __init__(
+        self, filename, mode="r", float_word_size=None, compression_level=None
+    ):
+        if mode not in ("r", "a", "w"):
+            raise ValueError(f"Invalid Exodus file mode {mode!r}")
+        if float_word_size is None:
+            float_word_size = config.float_word_size
+        if int(float_word_size) not in (4, 8):
+            raise ValueError(f"float_word_size must be 4 or 8, got {float_word_size!r}")
+        if compression_level is None:
+            compression_level = config.compression_level
+        if not 0 <= int(compression_level) <= 9:
+            raise ValueError(
+                f"compression_level must be in 0..9, got {compression_level!r}"
+            )
+        self.float_word_size = int(float_word_size)
+        self.compression_level = int(compression_level)
         self.mode = mode
         self.filename = filename
         if self.mode == "r":
@@ -133,8 +202,8 @@ class exodusii_file:
         return self._open(filename, mode)
 
     def close(self):
-        if self.mode == "w":
-            return nc.close(self.files[0])
+        """Close the underlying netCDF file(s); safe to call more than once."""
+        return nc.close(*getattr(self, "files", []))
 
     def is_edge_variable(self, variable):
         variables = self.get_edge_variable_names()
@@ -166,11 +235,13 @@ class exodusii_file:
     def get_dimension(self, name, default=None):
         return self._get_dimension(self.files[0], name, default)
 
-    def _get_variable(self, file, name, default, raw):
-        return nc.get_variable(file, name, default=default, raw=raw)
+    def _get_variable(self, file, name, default, raw, index=None):
+        return nc.get_variable(file, name, default=default, raw=raw, index=index)
 
-    def get_variable(self, name, default=None, raw=False):
-        return self._get_variable(self.files[0], name, default=default, raw=raw)
+    def get_variable(self, name, default=None, raw=False, index=None):
+        return self._get_variable(
+            self.files[0], name, default=default, raw=raw, index=index
+        )
 
     def variables(self):
         return self.files[0].variables
@@ -518,7 +589,7 @@ class exodusii_file:
         -------
         title : str
         """
-        return stringify(self.files[0].title)
+        return stringify(getattr(self.files[0], ex.ATT_TITLE, ""))
 
     def version_num(self):
         """Get exodus version number used to create the database
@@ -557,7 +628,8 @@ class exodusii_file:
 
     @requires_write_mode
     def create_variable(self, id, type, shape):
-        return nc.create_variable(self.fh, id, type, shape)
+        level = getattr(self, "compression_level", None)
+        return nc.create_variable(self.fh, id, type, shape, complevel=level)
 
     @requires_write_mode
     def fill_variable(self, name, *args):
@@ -577,12 +649,7 @@ class exodusii_file:
         -------
         gvar_vals : ndarray of float
         """
-        values = self.get_variable(ex.VAR_GLO_VAR)
-        if values is None:
-            return None
-        if time_step is None:
-            return values
-        return _select_time_step(values, time_step)
+        return self._get_time_variable(ex.VAR_GLO_VAR, time_step)
 
     def get_all_node_set_params(self):
         """Get total number of nodes and distribution factors (e.g. nodal
@@ -674,8 +741,7 @@ class exodusii_file:
         -------
         coords : ndarray of float
         """
-        coord_names = self.get_coord_variable_names()
-        coords = np.column_stack([self.get_variable(_) for _ in coord_names])
+        coords = _coords_from_file(self.fh, self.num_dimensions())
         if time_step is not None:
             displ = self.get_displ(time_step)
             if displ is not None:
@@ -1242,7 +1308,7 @@ class exodusii_file:
         block_ids = self.get_element_block_ids()
         blk_iid = self.get_iid(block_ids, block_id)
         names = self.get_element_block_names()
-        return names[blk_iid - 1]
+        return _name_at(names, blk_iid)
 
     def get_element_block_names(self):
         """Get a list of all element block names ordered by block *INDEX*; (see
@@ -1500,12 +1566,27 @@ class exodusii_file:
         names = self.get_element_variable_names()
         var_iid = self.get_iid(names, var_name)
         block_iid = self.get_element_block_iid(block_id)
-        values = self.get_variable(ex.VAR_ELEM_VAR(var_iid, block_iid))
-        if values is None:
+        return self._get_time_variable(ex.VAR_ELEM_VAR(var_iid, block_iid), time_step)
+
+    def _get_time_variable(self, name, time_step=None, column=None):
+        """Read a ``(time_step, ...)`` variable, or only one time step of it.
+
+        ``time_step`` is 1-based (negative counts from the end; 0 is invalid).
+        A single step is read by slicing the netCDF variable, so the rest of
+        the history is never loaded. ``column`` optionally selects one column
+        of a 2D variable (e.g. one global variable). Returns None if the
+        variable does not exist.
+        """
+        var = self.get_variable(name, raw=True)
+        if var is None:
             return None
         if time_step is None:
-            return values
-        return _select_time_step(values, time_step)
+            index = slice(None)
+        else:
+            index = _time_step_index(time_step, var.shape[0])
+        if column is not None:
+            index = (index, column)
+        return self.get_variable(name, index=index)
 
     def get_element_variable_values_across_blocks(self, var_name, time_step=None):
         values = []
@@ -1940,8 +2021,10 @@ class exodusii_file:
         -------
         gvar_val : float
         """
-        values = self.get_global_variable_values(var_name)
-        return _select_time_step(values, time_step)
+        var_iid = self.get_global_variable_iid(var_name)
+        if var_iid is None:
+            raise KeyError(f"{var_name!r} is not a global variable")
+        return self._get_time_variable(ex.VAR_GLO_VAR, time_step, column=var_iid - 1)
 
     def get_global_variable_values(self, var_name):
         """Get global variable values over all time steps for one global variable
@@ -1958,8 +2041,9 @@ class exodusii_file:
 
         """
         var_iid = self.get_global_variable_iid(var_name)
-        values = self.get_variable(ex.VAR_GLO_VAR)
-        return values[:, var_iid - 1]
+        if var_iid is None:
+            raise KeyError(f"{var_name!r} is not a global variable")
+        return self._get_time_variable(ex.VAR_GLO_VAR, None, column=var_iid - 1)
 
     def get_iid(self, container, item):
         if item not in container:
@@ -2068,7 +2152,7 @@ class exodusii_file:
         set_ids = self.get_node_set_ids()
         set_iid = self.get_iid(set_ids, set_id)
         names = self.get_node_set_names()
-        return names[set_iid - 1]
+        return _name_at(names, set_iid)
 
     def get_node_set_names(self):
         """Get a list of all node set names ordered by node set *INDEX*; (see
@@ -2186,7 +2270,7 @@ class exodusii_file:
             truth_table = truth_table[set_iid - 1]
         return truth_table
 
-    def get_node_set_variable_values(self, set_id, var_name, time_step):
+    def get_node_set_variable_values(self, set_id, var_name, time_step=None):
         """Get list of node set variable values for a specified node set, node set
         variable name, and time step; the list has one variable value per node in the
         set
@@ -2205,7 +2289,12 @@ class exodusii_file:
         nsvar_vals : ndarray of float
 
         """
-        raise NotImplementedError
+        names = self.get_node_set_variable_names()
+        var_iid = self.get_iid(names, var_name)
+        set_iid = self.get_node_set_iid(set_id)
+        if var_iid is None or set_iid is None:
+            return None
+        return self._get_time_variable(ex.VAR_NODE_SET_VAR(var_iid, set_iid), time_step)
 
     def get_node_variable_history(self, var_name, node_id):
         """Get nodal variable values for a nodal variable var_name at node `node_id`
@@ -2264,12 +2353,7 @@ class exodusii_file:
         """
         names = self.get_node_variable_names()
         var_iid = self.get_iid(names, var_name)
-        values = self.get_variable(ex.VAR_NODE_VAR(var_iid))
-        if values is None:
-            return None
-        if time_step is None:
-            return values
-        return _select_time_step(values, time_step)
+        return self._get_time_variable(ex.VAR_NODE_VAR(var_iid), time_step)
 
     def get_qa_records(self):
         """Get a list of QA records where each QA record is a length-4 tuple of
@@ -2365,7 +2449,7 @@ class exodusii_file:
         set_ids = self.get_side_set_ids()
         set_iid = self.get_iid(set_ids, set_id)
         names = self.get_side_set_names()
-        return names[set_iid - 1]
+        return _name_at(names, set_iid)
 
     def get_side_set_names(self):
         """Get a list of all side set names ordered by side set *INDEX*; (see
@@ -2624,7 +2708,7 @@ class exodusii_file:
         version = 5.0300002
         self.setattr(ex.ATT_API_VERSION, version)
         self.setattr(ex.ATT_VERSION, version)
-        self.setattr(ex.ATT_FLT_WORDSIZE, config.float_word_size)
+        self.setattr(ex.ATT_FLT_WORDSIZE, self.float_word_size)
         self.setattr(ex.ATT_FILESIZE, 1)
 
         self.create_dimension(ex.DIM_TIME, None)
@@ -2761,7 +2845,7 @@ class exodusii_file:
 
         """
         block_iid = self.get_element_block_iid(block_id)
-        return self.get_dimension(ex.DIM_NUM_ELEM_IN_ELEM_BLK(block_iid))
+        return self.get_dimension(ex.DIM_NUM_ELEM_IN_ELEM_BLK(block_iid), default=0)
 
     def num_face_attr(self, block_id):
         """get the number of attributes per face for an face block
@@ -2905,7 +2989,7 @@ class exodusii_file:
         num_ns_nodes : int
         """
         node_set_nodes = self.get_node_set_nodes(set_id)
-        return len(node_set_nodes)
+        return 0 if node_set_nodes is None else len(node_set_nodes)
 
     def num_nodes_per_edge(self, block_id):
         """Get the number of nodes per edge for a edge block
@@ -2986,7 +3070,7 @@ class exodusii_file:
         num_ss_sides : int
         """
         side_set_sides = self.get_side_set_sides(set_id)
-        return len(side_set_sides)
+        return 0 if side_set_sides is None else len(side_set_sides)
 
     def num_times(self):
         """Get the number of time steps
@@ -2995,7 +3079,8 @@ class exodusii_file:
         -------
         num_times : int
         """
-        return len(self.get_times())
+        times = self.get_times()
+        return 0 if times is None else len(times)
 
     @requires_write_mode
     def put_coord(self, *coords):
@@ -3337,6 +3422,13 @@ class exodusii_file:
         )
 
         self.fh.variables[ex.VAR_ID_ELEM_BLK][num_blocks_counted] = block_id
+        if not num_block_elems:
+            # NULL block: like the Exodus library, record the id with status 0
+            # and define no dimensions (a 0-length netCDF dimension would be
+            # unlimited) or connectivity.
+            self.fh.variables[ex.VAR_STAT_ELEM_BLK][num_blocks_counted] = 0
+            self._counter[counter] += 1
+            return
         for (i, dim) in enumerate(dims):
             if nums[i] is not None:
                 self.create_dimension(dim, nums[i])
@@ -3366,8 +3458,9 @@ class exodusii_file:
             self.fill_variable(var, np.zeros(num_attr))
 
             var = ex.VAR_NAME_ELEM_BLK_ATTRIB(block_iid)
-            self.create_variable(var, str, (dims[1], ex.DIM_NAME))
-            self.fill_variable(var, " " * MAX_NAME_LENGTH)
+            self.create_variable(var, str, (dim, ex.DIM_NAME))
+            for i in range(num_attr):
+                self.fill_variable(var, i, " " * MAX_NAME_LENGTH)
 
         self._counter[counter] += 1
 
@@ -3519,14 +3612,28 @@ class exodusii_file:
             self.fill_variable(ex.VAR_NAME_ELEM_VAR, i, name)
 
     @requires_write_mode
-    def put_element_variable_params(self, num_vars):
+    def put_element_variable_params(self, num_vars, truth_table=None):
         """Writes the number of node variables that will be written to the database.
 
         Parameters
         ----------
         num_vars : int
             The number of element variables that will be written to the database.
+        truth_table : array_like, (num_elem_blk, num_vars), optional
+            Element variable truth table. When given, value variables are only
+            created where the table is non-zero and the table is written to
+            the file (do not call put_element_variable_truth_table afterwards).
+            By default every variable is created on every block and no table
+            is written.
         """
+        num_blk = self.get_dimension(ex.DIM_NUM_ELEM_BLK, default=0)
+        if truth_table is not None:
+            truth_table = np.asarray(truth_table, dtype=int)
+            if truth_table.shape != (num_blk, num_vars):
+                raise ValueError(
+                    f"truth_table has shape {truth_table.shape}, expected "
+                    f"({num_blk}, {num_vars})"
+                )
         self.create_dimension(ex.DIM_NUM_ELEM_VAR, num_vars)
         self.create_variable(
             ex.VAR_NAME_ELEM_VAR, str, (ex.DIM_NUM_ELEM_VAR, ex.DIM_NAME)
@@ -3534,9 +3641,16 @@ class exodusii_file:
         for block_id in self.get_element_block_ids():
             block_iid = self.get_element_block_iid(block_id)
             for i in range(num_vars):
+                if truth_table is not None and not truth_table[block_iid - 1, i]:
+                    continue
                 name = ex.VAR_ELEM_VAR(i + 1, block_iid)
                 shape = (ex.DIM_TIME, ex.DIM_NUM_ELEM_IN_ELEM_BLK(block_iid))
                 self.create_variable(name, float, shape)
+        if truth_table is not None:
+            self.create_variable(
+                ex.VAR_ELEM_TAB, int, (ex.DIM_NUM_ELEM_BLK, ex.DIM_NUM_ELEM_VAR)
+            )
+            self.fill_variable(ex.VAR_ELEM_TAB, truth_table)
 
     @requires_write_mode
     def put_element_variable_values(self, time_step, block_id, name, values):
@@ -3867,8 +3981,11 @@ class exodusii_file:
         num_info = len(info)
         self.create_dimension(ex.DIM_NUM_INFO, num_info)
         self.create_variable(ex.VAR_INFO, str, (ex.DIM_NUM_INFO, ex.DIM_LIN))
+        len_line = self.get_dimension(ex.DIM_LIN)
         for (i, info_record) in enumerate(info):
-            self.fh.variables[ex.VAR_INFO][i] = "{0:{1}s}".format(info_record, 80)
+            # pad to the line dimension (at most len_line - 1 characters)
+            value = str(info_record)[: len_line - 1].ljust(len_line)
+            self.fill_variable(ex.VAR_INFO, i, value)
 
     @requires_write_mode
     def put_init(
@@ -4027,6 +4144,7 @@ class exodusii_file:
         name : str
             The node set name
         """
+        name = self._pad_name(name)
         set_ids = self.get_node_set_ids()
         set_iid = self.get_iid(set_ids, set_id)
         self.fill_variable(ex.VAR_NAME_NODE_SET, set_iid - 1, name)
@@ -4063,9 +4181,10 @@ class exodusii_file:
         )
         for set_id in self.get_node_set_ids():
             set_iid = self.get_node_set_iid(set_id)
+            dim = ex.DIM_NUM_NODE_NODE_SET(set_iid)
             for i in range(num_vars):
                 name = ex.VAR_NODE_SET_VAR(i + 1, set_iid)
-                self.create_variable(name, float, (ex.DIM_TIME, "num_node"))
+                self.create_variable(name, float, (ex.DIM_TIME, dim))
 
     @requires_write_mode
     def put_node_set_variable_values(self, time_step, set_id, name, values):
@@ -4095,9 +4214,12 @@ class exodusii_file:
         """
         names = self.get_node_set_variable_names()
         var_iid = self.get_iid(names, name)
-        set_iid = self.get_edge_block_iid(set_id)
-        key = ex.VAL_NODE_SET_VAR(var_iid, set_iid)
-        self.fh.variables[key][time_step - 1, : len(values)] = values
+        set_iid = self.get_node_set_iid(set_id)
+        key = ex.VAR_NODE_SET_VAR(var_iid, set_iid)
+        if time_step is None:
+            self.fh.variables[key][:] = values
+        else:
+            self.fh.variables[key][time_step - 1, : len(values)] = values
 
     @requires_write_mode
     def put_node_set_nodes(self, set_id, node_set_nodes):
@@ -4171,6 +4293,11 @@ class exodusii_file:
             raise ValueError("Allocated number of node sets exceeded")
 
         self.fh.variables[ex.VAR_NODE_SET_IDS][num_counted_ns] = int(set_id)
+        if not num_nodes_in_set:
+            # Empty set: status 0 and no dimensions (see put_element_block).
+            self.fh.variables[ex.VAR_NODE_SET_STAT][num_counted_ns] = 0
+            self._counter["ns"] += 1
+            return
         self.fh.variables[ex.VAR_NODE_SET_STAT][num_counted_ns] = 1
 
         dim = ex.DIM_NUM_NODE_NODE_SET(set_iid)
@@ -4273,11 +4400,12 @@ class exodusii_file:
         self.create_variable(
             ex.VAR_QA_TITLE, str, (ex.DIM_NUM_QA, ex.DIM_N4, ex.DIM_STR)
         )
+        len_str = self.get_dimension(ex.DIM_STR)
         for (i, qa_record) in enumerate(qa_records):
-            self.fill_variable(ex.VAR_QA_TITLE, i, 0, qa_record[0])
-            self.fill_variable(ex.VAR_QA_TITLE, i, 1, qa_record[1])
-            self.fill_variable(ex.VAR_QA_TITLE, i, 2, qa_record[2])
-            self.fill_variable(ex.VAR_QA_TITLE, i, 3, qa_record[3])
+            for j in range(4):
+                # pad to the string dimension (at most len_str - 1 characters)
+                value = str(qa_record[j])[: len_str - 1].ljust(len_str)
+                self.fill_variable(ex.VAR_QA_TITLE, i, j, value)
 
     @requires_write_mode
     def put_side_set_sides(self, set_id, side_set_elems, side_set_sides):
@@ -4374,6 +4502,11 @@ class exodusii_file:
             raise ValueError("Allocated number of side sets exceeded")
 
         self.fh.variables[ex.VAR_SIDE_SET_IDS][num_counted_ss] = int(set_id)
+        if not num_sides_in_set:
+            # Empty set: status 0 and no dimensions (see put_element_block).
+            self.fh.variables[ex.VAR_SIDE_SET_STAT][num_counted_ss] = 0
+            self._counter["ss"] += 1
+            return
         self.fh.variables[ex.VAR_SIDE_SET_STAT][num_counted_ss] = 1
 
         dim = ex.DIM_NUM_SIDE_SIDE_SET(set_iid)

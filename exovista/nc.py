@@ -1,80 +1,56 @@
+"""Thin helpers over :mod:`netCDF4` used by the vendored ExodusII core.
+
+netCDF4 is a hard dependency; there is no pure-Python fallback.
+"""
+
 import numpy as np
-from functools import wraps
+from netCDF4 import Dataset
+
 from .util import stringify, string_kinds
 from .config import config
 
 
-if not config.use_netcdf4_if_possible:
-    _netcdf4 = False
-    from .netcdf import netcdf_file as Dataset
-else:
-    try:
-        _netcdf4 = True
-        from netCDF4 import Dataset
-    except (ImportError, ValueError):
-        _netcdf4 = False
-        from .netcdf import netcdf_file as Dataset
-
-
 def library():
-    return "netcdf4" if _netcdf4 else "netcdf"
+    return "netcdf4"
 
 
 def open(filename, mode="r"):
-    if _netcdf4:
-        try:
-            fh = Dataset(filename, mode=mode, format="NETCDF4_CLASSIC")
-        except (OSError, TypeError):
-            fh = Dataset(filename, mode=mode, format="NETCDF3_64BIT_OFFSET")
-    else:
-        fh = Dataset(filename, mode=mode)
-    return fh
+    if mode == "w":
+        return Dataset(filename, mode=mode, format="NETCDF4_CLASSIC")
+    return Dataset(filename, mode=mode)
 
 
 def close(*files):
     for file in files:
         try:
-            file.close()
+            if file.isopen():
+                file.close()
         except Exception:
             pass
 
 
 def filename(fh):
-    return fh.filepath() if _netcdf4 else fh.filename
+    return fh.filepath()
 
 
-def cache(fun):
-    sentinel = object()
-    global_cache = dict()
-    cache_get = global_cache.get
+def get_variable(fh, name, default=None, raw=False, index=None):
+    """Return the data of variable ``name`` (or ``default`` if absent).
 
-    def make_key(fh, name, **kwds):
-        s = ", ".join(f"{k}={v}" for (k, v) in kwds.items())
-        return f"{filename(fh)}::{fun.__name__}::{name}({s})"
-
-    @wraps(fun)
-    def wrapper(fh, name, **kwds):
-        key = make_key(fh, name, **kwds)
-        val = cache_get(key, sentinel)
-        if val is not sentinel:
-            return val
-        val = fun(fh, name, **kwds)
-        global_cache[key] = val
-        return val
-
-    return wrapper
-
-
-def get_variable(fh, name, default=None, raw=False):
+    Parameters
+    ----------
+    raw : bool
+        Return the :class:`netCDF4.Variable` itself instead of its data.
+    index : int, slice or tuple, optional
+        Read only ``var[index]`` (e.g. a single time step) instead of the whole
+        variable, so large time histories are never loaded just to be sliced.
+    """
     if name not in fh.variables:
         return default
     var = fh.variables[name]
     if raw:
         return var
-    if _netcdf4:
-        val = var[:].data
-    else:
-        val = var.data
+    val = var[:] if index is None else var[index]
+    val = np.ma.getdata(val)
     if isinstance(val, np.ndarray) and val.dtype.kind in string_kinds:
         val = stringify(val)
     elif isinstance(val, bytes):
@@ -85,43 +61,43 @@ def get_variable(fh, name, default=None, raw=False):
 def get_dimension(fh, name, default=None):
     if name not in fh.dimensions:
         return default
-    x = fh.dimensions[name]
-    dim = x if not _netcdf4 else x.size
+    dim = fh.dimensions[name].size
     if dim is None and name != "time_step":
         return 0
     return int(dim)
 
 
 def setncattr(fh, variable, name, value):
-    if _netcdf4:
-        fh.variables[variable].setncattr(name, value)
-    else:
-        setattr(fh.variables[variable], name, value)
+    fh.variables[variable].setncattr(name, value)
 
 
 def create_dimension(fh, name, value):
     fh.createDimension(name, value)
 
 
-def create_variable(fh, id, type, shape):
+def create_variable(fh, id, type, shape, complevel=None):
+    """Create variable ``id``; float word size follows the file's attribute.
+
+    ``complevel`` is the deflate level (0 disables compression); ``None`` uses
+    the configured default (``EXODUSII_COMPRESSION_LEVEL``).
+    """
     if type is float:
         word_size = getattr(fh, "floating_point_word_size", 8)
         kind = "f" if int(word_size) == 4 else "d"
     else:
         kind = {str: "c", int: "i"}[type]
-    fh.createVariable(id, kind, shape, **_compression_kwds(fh, shape))
+    fh.createVariable(id, kind, shape, **_compression_kwds(fh, shape, complevel))
 
 
-def _compression_kwds(fh, shape):
+def _compression_kwds(fh, shape, complevel=None):
     """Return netCDF4 compression keywords for createVariable, when applicable.
 
-    Compression (HDF5 deflate) is only available for the netCDF4 backed
-    formats; it is silently skipped for the netCDF3 fallback and for the pure
-    Python netcdf writer. Scalar variables (no dimensions) cannot be chunked,
-    so they are left uncompressed.
+    Compression (HDF5 deflate) is only available for the HDF5 based NETCDF4
+    formats. Scalar variables (no dimensions) cannot be chunked, so they are
+    left uncompressed.
     """
-    level = getattr(config, "compression_level", 0)
-    if not _netcdf4 or not level or not shape:
+    level = config.compression_level if complevel is None else complevel
+    if not level or not shape:
         return {}
     # zlib/chunking is only supported by the HDF5 based NETCDF4* data models.
     if not str(getattr(fh, "data_model", "")).startswith("NETCDF4"):

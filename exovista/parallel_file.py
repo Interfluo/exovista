@@ -3,7 +3,8 @@ import numpy as np
 from argparse import Namespace
 
 from .copy import copy
-from .file import exodusii_file
+from .file import exodusii_file, _coords_from_file, _time_step_index
+from . import nc
 from .ex_params import ex_init_params
 from .util import stringify
 from .config import config
@@ -41,13 +42,21 @@ class parallel_exodusii_file(exodusii_file):
         return ",".join(self.get_filename(f) for f in self.files)
 
     def open(self, *files):
-        self.files = [self._open(file, "r") for file in sorted(files)]
-        self.check_consistency(self.files)
+        self.files = []
+        try:
+            for file in sorted(files):
+                self.files.append(self._open(file, "r"))
+            self.check_consistency(self.files)
+        except Exception:
+            # do not leak the handles opened so far
+            nc.close(*self.files)
+            raise
 
         return self.files
 
     def close(self):
-        pass
+        """Close every constituent file; safe to call more than once."""
+        nc.close(*self.files)
 
     def write(self, filename):
         """Write the parallel Exodus file to a single file"""
@@ -73,6 +82,7 @@ class parallel_exodusii_file(exodusii_file):
     def get_variable(self, *args, **kwargs):
         default = kwargs.get("default", None)
         raw = kwargs.get("raw", False)
+        index = kwargs.get("index", None)
         if len(args) == 1:
             file, name = self.files[0], args[0]
         elif len(args) == 2:
@@ -82,7 +92,7 @@ class parallel_exodusii_file(exodusii_file):
             raise TypeError(
                 f"get_variable() takes 1 or 2 positional arguments but {n} were given"
             )
-        return self._get_variable(file, name, default, raw)
+        return self._get_variable(file, name, default, raw, index=index)
 
     def variables(self):
         return self.files[0].variables
@@ -121,14 +131,14 @@ class parallel_exodusii_file(exodusii_file):
         -------
         coords : ndarray of float
         """
-        coord_names = self.get_coord_variable_names()
-        coords = np.zeros((self.num_nodes(), self.num_dimensions()), dtype=float)
+        num_dim = self.num_dimensions()
+        coords = np.zeros((self.num_nodes(), num_dim), dtype=float)
 
         lid_to_gid = self.get_mapping(ex.maps.node_local_to_global, contiguous=True)
         for (fid, file) in enumerate(self.files):
             num_nodes = self.get_dimension(file, ex.DIM_NUM_NODES)
             gids = [lid_to_gid[(fid, lid)] - 1 for lid in range(1, num_nodes + 1)]
-            x = np.column_stack([self.get_variable(file, _) for _ in coord_names])
+            x = _coords_from_file(file, num_dim)
             assert x.shape[0] == num_nodes
             coords[gids, :] = x
         if time_step is not None:
@@ -526,29 +536,43 @@ class parallel_exodusii_file(exodusii_file):
 
         names = self.get_element_variable_names()
         var_iid = self.get_iid(names, var_name)
+        if var_iid is None:
+            return None
 
-        shape = (self.num_times(), self.num_elems_in_blk(block_id))
+        # A single time step is read by slicing each file's variable.
+        if time_step is None:
+            index = slice(None)
+            shape = (self.num_times(), self.num_elems_in_blk(block_id))
+        else:
+            index = _time_step_index(time_step, self.num_times())
+            shape = (self.num_elems_in_blk(block_id),)
         values = np.zeros(shape, dtype=float)
 
         map1 = self.get_mapping(
             ex.maps.elem_block_elem_local_to_global, contiguous=True
         )
         map2 = self.get_mapping(ex.maps.elem_block_elem_global_to_local)
+        active = found = 0
         for (fid, file) in enumerate(self.files):
             block_iid = self.f_get_element_block_iid(file, block_id)
             if not self.elem_block_is_active(file, block_iid):
                 continue
-            local_vals = self.get_variable(file, ex.VAR_ELEM_VAR(var_iid, block_iid))
-            cols = np.zeros(local_vals.shape[1], dtype=int)
+            active += 1
+            local_vals = self.get_variable(
+                file, ex.VAR_ELEM_VAR(var_iid, block_iid), index=index
+            )
+            if local_vals is None:
+                # Not defined on this block (element variable truth table).
+                continue
+            found += 1
+            cols = np.zeros(local_vals.shape[-1], dtype=int)
             for iid in range(len(cols)):
                 gid = map1[(fid, block_id, iid + 1)]
                 cols[iid] = map2[(block_id, gid)] - 1
-            values[:, cols] = local_vals
-        if time_step is None:
-            return values
-        elif time_step < 0:
-            time_step = len(values)
-        return values[time_step - 1]
+            values[..., cols] = local_vals
+        if active and not found:
+            return None
+        return values
 
     def get_element_variable_values_across_blocks(self, var_name, time_step=None):
         values = []
@@ -892,17 +916,22 @@ class parallel_exodusii_file(exodusii_file):
         var_iid = self.get_iid(names, var_name)
         if var_iid is None:
             return None
-        values = np.zeros((self.num_times(), self.num_nodes()), dtype=float)
-        node_map = self.get_mapping(ex.maps.node_local_to_global)
+        # A single time step is read by slicing each file's variable.
+        if time_step is None:
+            index = slice(None)
+            shape = (self.num_times(), self.num_nodes())
+        else:
+            index = _time_step_index(time_step, self.num_times())
+            shape = (self.num_nodes(),)
+        values = np.zeros(shape, dtype=float)
+        node_map = self.get_mapping(ex.maps.node_local_to_global, contiguous=True)
         for (fid, file) in enumerate(self.files):
             num_nodes = self.get_dimension(file, ex.DIM_NUM_NODES)
             cols = [node_map[(fid, lid)] - 1 for lid in range(1, num_nodes + 1)]
-            values[:, cols] = self.get_variable(file, ex.VAR_NODE_VAR(var_iid))
-        if time_step is None:
-            return values
-        elif time_step < 0:
-            time_step = len(values)
-        return values[time_step - 1]
+            values[..., cols] = self.get_variable(
+                file, ex.VAR_NODE_VAR(var_iid), index=index
+            )
+        return values
 
     def get_qa_records(self):
         """Get a list of QA records where each QA record is a length-4 tuple of

@@ -15,6 +15,8 @@ def stringify(a):
     elif isinstance(a, bytes):
         return a.decode()
     elif isinstance(a, np.ndarray):
+        if a.dtype.kind == "S" and a.dtype.itemsize == 1 and a.ndim in (1, 2):
+            return _stringify_chars(a)
         if len(a.shape) == 1:
             return "".join(decode(x) for x in a if x).rstrip()
         elif len(a.shape) == 2:
@@ -26,6 +28,23 @@ def stringify(a):
             raise TypeError(f"Cannot stringify arrays with shape {a.shape}")
     else:
         raise TypeError(f"Cannot stringify items of type {type(a).__name__}")
+
+
+def _stringify_chars(a):
+    """Fast path of :func:`stringify` for 1D/2D netCDF char (``S1``) arrays.
+
+    Same result as joining the characters of each row with NUL bytes removed
+    and trailing whitespace stripped, but without a Python loop per character.
+    """
+    n = a.shape[-1]
+    if n == 0:
+        return "" if a.ndim == 1 else np.array([""] * a.shape[0])
+    rows = np.ascontiguousarray(a).view(f"S{n}").reshape(a.shape[:-1])
+    strings = [
+        row.replace(b"\0", b"").decode("utf-8", "replace").rstrip()
+        for row in rows.reshape(-1).tolist()
+    ]
+    return strings[0] if a.ndim == 1 else np.array(strings)
 
 
 def decode(x):
