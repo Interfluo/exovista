@@ -1,445 +1,891 @@
-"""ExodusII to PyVista import module.
+"""Read ExodusII databases into PyVista objects.
 
-This module is the read counterpart to :mod:`exovista.write_pyvista`. It loads
-an ExodusII database into a :class:`pyvista.UnstructuredGrid`, reconstructing:
+This is the read counterpart of :mod:`exovista.write_pyvista`, built on
+:func:`exovista._backend.open_reader` (serial files and parallel
+decompositions) and the element tables of :mod:`exovista._celltypes`.
 
-- Node coordinates (2D meshes are embedded in 3D with ``z = 0``).
-- Element blocks (concatenated, in block order) with the originating Exodus
-  block id and name recorded as cell data.
-- Node variables (point data) and element variables (cell data) sampled at a
-  chosen time step.
-- The time history, exposed via ``grid.field_data["times"]``.
+* :func:`read_exo` -- the mesh as one :class:`pyvista.UnstructuredGrid`
+  (float64 points in file node order; all supported element types including
+  quadratic cells, shells, bars and spheres) with node, element and global
+  variables at one time step, and optionally the side sets.
+* :func:`read_side_sets` / :func:`read_node_sets` -- the sets alone.
+* :func:`read_node_fields` / :func:`read_element_fields` /
+  :func:`read_global_fields` -- whole time histories without building a mesh.
 
-It handles both serial files and globbed parallel decompositions through
-:func:`exovista.File`.
+Element order
+-------------
+Exodus stores elements grouped by block. :func:`exovista.write_exo` records
+each element's original cell index in the element id map
+(``elem_num_map``). With ``original_order=True`` (the default), whenever the
+map is a permutation of ``1..num_elem``, cells (and element variables) are
+returned so that cell ``i`` has element id ``i + 1``, i.e. in the order of the
+mesh that was written. Otherwise the file order (blocks concatenated) is kept.
 """
+
+from __future__ import annotations
+
+import operator
+import warnings
+from collections.abc import Iterable
 
 import numpy as np
 import pyvista as pv
+from vtkmodules.util.numpy_support import numpy_to_vtk
+from vtkmodules.vtkCommonCore import vtkStringArray
 
-from .file import exodusii_file
-from .parallel_file import parallel_exodusii_file
-from .write_pyvista import _vtk_face_nodes, vtk2exo_faceorder
+from ._backend import ExodusReader, open_reader
+from ._celltypes import ExoType, resolve_exo_type
+from ._model import component_suffixes
 
+__all__ = [
+    "read_exo",
+    "read_side_sets",
+    "read_node_sets",
+    "read_node_fields",
+    "read_element_fields",
+    "read_global_fields",
+]
 
-# Inverse of write_pyvista.vtk2exo. Keys are the canonical Exodus element type
-# names (uppercased, as stored on disk via ATT_NAME_ELEM_TYPE). PIXEL/VOXEL are
-# absent because write_exo normalizes them to QUAD/HEX before writing.
-_exo2vtk = {
-    "TRI": pv.CellType.TRIANGLE,
-    "TRI3": pv.CellType.TRIANGLE,
-    "TRIANGLE": pv.CellType.TRIANGLE,
-    "TRIANGLE3": pv.CellType.TRIANGLE,
-    "QUAD": pv.CellType.QUAD,
-    "QUAD4": pv.CellType.QUAD,
-    "QUADRILATERAL": pv.CellType.QUAD,
-    "TET": pv.CellType.TETRA,
-    "TET4": pv.CellType.TETRA,
-    "TETRA": pv.CellType.TETRA,
-    "TETRA4": pv.CellType.TETRA,
-    "TETRAHEDRON": pv.CellType.TETRA,
-    "HEX": pv.CellType.HEXAHEDRON,
-    "HEX8": pv.CellType.HEXAHEDRON,
-    "HEXAHEDRON": pv.CellType.HEXAHEDRON,
-    "WEDGE": pv.CellType.WEDGE,
-    "WEDGE6": pv.CellType.WEDGE,
-    "PYRAMID": pv.CellType.PYRAMID,
-    "PYRAMID5": pv.CellType.PYRAMID,
-    "PYRA": pv.CellType.PYRAMID,
-    "PYRA5": pv.CellType.PYRAMID,
-}
+# Keys read_exo always fills with their documented meaning.
+_RESERVED_CELL_ARRAYS = ("exo_block_id", "exo_block_name", "exo_elem_id")
+_RESERVED_FIELD_DATA = ("times", "time", "num_dim")
+
+# netCDF's default fill value for floats: a time value that was never written.
+_NETCDF_FLOAT_FILL = 9.969209968386869e36
+
+# Letter suffixes of multi-component variables (see _model.component_suffixes).
+_LETTER_SUFFIXES = frozenset(
+    s[1:] for n in (2, 3, 6, 9) for s in component_suffixes(n)
+)
 
 
-def _resolve_vtk_cell_type(elem_type):
-    """Map an Exodus element-type string to a PyVista/VTK cell type."""
-    key = str(elem_type).strip().upper()
-    if key in _exo2vtk:
-        return _exo2vtk[key]
-    # Fall back to the alphabetic prefix (e.g. "HEX20" -> "HEX") so linear
-    # readers degrade gracefully on higher-order names they share a base with.
-    base = key.rstrip("0123456789")
-    if base in _exo2vtk:
-        return _exo2vtk[base]
-    raise ValueError(
-        f"Unsupported Exodus element type {elem_type!r} for PyVista import"
-    )
-
-
-def _open(filename, *files):
-    """Open ``filename`` (and any extra parallel parts) for reading."""
-    if files:
-        return parallel_exodusii_file(filename, *files)
-    return exodusii_file(filename, mode="r")
-
-
-def read_exo(filename, *files, time_step=-1, read_node_variables=True,
-             read_element_variables=True, read_side_sets=False):
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+def read_exo(
+    filename,
+    *files,
+    time_step=-1,
+    read_node_variables=True,
+    read_element_variables=True,
+    read_global_variables=True,
+    read_side_sets=False,
+    combine_components=True,
+    original_order=True,
+):
     """Read an ExodusII file into a :class:`pyvista.UnstructuredGrid`.
-
-    This is the inverse of :func:`exovista.write_exo`.
 
     Parameters
     ----------
-    filename : str
-        Path to the ExodusII file. For a parallel decomposition pass the
-        remaining parts as additional positional arguments.
-    *files : str
-        Additional file parts of a parallel decomposition.
-    time_step : int, optional
-        1-based time step at which to sample node/element variables. Negative
-        values index from the end, so the default ``-1`` selects the last step.
-        Ignored when the file has no variables.
-    read_node_variables : bool, str, or list of str, optional
-        Which node variables to load into ``grid.point_data``. ``True``
-        (default) loads all, ``False`` loads none, and a name or list of names
-        loads only those variables (useful to avoid reading fields you do not
-        need). Unknown names raise ``KeyError``.
-    read_element_variables : bool, str, or list of str, optional
-        Which element variables to load into ``grid.cell_data``. Same
-        semantics as ``read_node_variables``.
-    read_side_sets : bool, optional
-        If True, also reconstruct side sets as surface geometry and return them
-        alongside the volume mesh. Default is False.
+    filename : str or os.PathLike
+        The Exodus file, or the first part of a parallel decomposition. Glob
+        patterns (``"run.exo.4.*"``) are expanded.
+    *files : str or os.PathLike
+        Remaining parts of a parallel decomposition. The parts are joined into
+        one mesh with global node and element numbering.
+    time_step : int, default: -1
+        **1-based** time step at which node, element and global variables are
+        sampled; negative values count from the end (``-1`` is the last
+        step). ``0`` and steps outside ``1..n_steps`` raise ``IndexError``.
+        Ignored (other than ``0``) when the file has no time steps.
+    read_node_variables, read_element_variables : bool, str or list of str
+        Which node (point data) / element (cell data) variables to read:
+        ``True`` (default) all, ``False`` none, or a name / list of names.
+        Names may be combined names (``"velocity"``) or the scalar names
+        stored in the file (``"velocity_X"``). Unknown names raise
+        ``KeyError``.
+    read_global_variables : bool, str or list of str
+        Which global variables to store in ``grid.field_data`` (one-element
+        arrays holding the value at ``time_step``). Same semantics.
+    read_side_sets : bool, default: False
+        Also return the side sets (see :func:`read_side_sets`).
+    combine_components : bool, default: True
+        Recombine scalar variables named with exovista's component suffixes
+        (``_X, _Y[, _Z]``; symmetric tensors ``_XX, _YY, _ZZ, _XY, _YZ,
+        _XZ``; full tensors ``_XX, _XY, ... _ZZ``; otherwise ``_0 .. _{n-1}``)
+        into one multi-component array, but only when all components of the
+        array are present and the combined name is not itself a variable.
+    original_order : bool, default: True
+        If the element id map is a permutation of ``1..num_elem`` (as written
+        by :func:`exovista.write_exo`), return the cells sorted by element id,
+        restoring the cell order of the mesh that was written. Otherwise, and
+        with ``False``, cells are in file order (blocks concatenated).
 
     Returns
     -------
     pyvista.UnstructuredGrid
-        The reconstructed mesh. ``grid.field_data["times"]`` holds the time
-        history (empty if the file is static) and ``grid.field_data["num_dim"]``
-        records the original spatial dimension.
+        Points are float64 in file node order (never downcast; a 2D file
+        gets ``z = 0``). Cell data:
+
+        * ``exo_block_id`` -- Exodus element block id of each cell;
+        * ``exo_block_name`` -- block name (``""`` if unnamed);
+        * ``exo_elem_id`` -- element id from the element id map (``1..N`` in
+          file order if the file has none);
+        * the element variables (NaN on blocks a variable is not defined on).
+
+        Point data holds the node variables. Field data holds ``"times"``
+        (all time values), ``"time"`` (the selected time; absent when the
+        file has no time steps), ``"num_dim"`` and the global variables.
     pyvista.MultiBlock
-        Only returned when ``read_side_sets=True``. A block per side set (named
-        after the side set) of :class:`pyvista.PolyData` faces. Each face cell
-        carries ``orig_elem_id`` (1-based Exodus element id) and ``face_id``
-        (1-based local side id) cell data. The surfaces share the volume's node
-        coordinates, so node ids index back into ``grid``.
+        Only with ``read_side_sets=True``: the result of
+        :func:`read_side_sets` (with the same ``original_order``). The side
+        sets share the grid's points.
+
+    Warns
+    -----
+    UserWarning
+        For element blocks of an unsupported element type (they are skipped),
+        side-set entries that cannot be resolved, and variables whose names
+        clash with the reserved arrays above (they are skipped; use
+        :func:`read_element_fields` / :func:`read_global_fields`).
+
+    Notes
+    -----
+    Files written by exovista 1.x are read as they were meant: their
+    triangles (``TRI3`` blocks in a 3D file) keep edge side numbering, and
+    their unwritten time value of a single static step reads as ``0.0``.
     """
-    f = _open(filename, *files)
-    try:
-        points = _read_points(f)
-        blocks = _read_blocks(f)
-        grid = _build_grid(
-            f, points, blocks, time_step,
-            read_node_variables, read_element_variables,
-        )
+    with open_reader(filename, *files) as r:
+        layout = _Layout(r, original_order)
+        times = _read_times(r, layout.legacy)
+        step = _resolve_step(time_step, len(times))
+
+        points = _points(r)
+        vtk_pts = pv.vtk_points(points, deep=False, force_float=False)
+        grid = _build_grid(layout, vtk_pts)
+
+        if step is not None:
+            node_plan = _select(
+                _plan(r.node_var_names(), combine_components),
+                read_node_variables,
+                "node",
+            )
+            for out_name, components in node_plan:
+                values = [r.node_var(name, step) for name in components]
+                grid.point_data[out_name] = _stack(values, components, out_name)
+
+            elem_plan = _select(
+                _plan(r.elem_var_names(), combine_components),
+                read_element_variables,
+                "element",
+            )
+            elem_plan = _drop_reserved(elem_plan, _RESERVED_CELL_ARRAYS, "element")
+            for out_name, components in elem_plan:
+                values = [layout.cell_values(r, name, step) for name in components]
+                grid.cell_data[out_name] = _stack(values, components, out_name)
+
+            glob_plan = _select(
+                _plan(r.global_var_names(), False), read_global_variables, "global"
+            )
+            glob_plan = _drop_reserved(glob_plan, _RESERVED_FIELD_DATA, "global")
+            for out_name, (name,) in glob_plan:
+                grid.field_data[out_name] = np.array([r.global_var(name, step)])
+
+        grid.field_data["times"] = times
+        if step is not None:
+            grid.field_data["time"] = times[step : step + 1].copy()
+        grid.field_data["num_dim"] = np.array([r.num_dim])
+
         if read_side_sets:
-            side_sets = _reconstruct_side_sets(f, points, blocks)
-            return grid, side_sets
+            return grid, _side_sets(r, layout, vtk_pts)
         return grid
-    finally:
-        f.close()
 
 
-def _read_points(f):
-    """Return node coordinates embedded in 3D (lower dims padded with zeros)."""
-    coords = np.asarray(f.get_coords(), dtype=float)
-    if coords.ndim == 1:
-        coords = coords.reshape(-1, 1)
-    points = np.zeros((coords.shape[0], 3), dtype=float)
-    points[:, : coords.shape[1]] = coords
+def read_side_sets(filename, *files, original_order=True):
+    """Read the side sets of an ExodusII file.
+
+    Parameters
+    ----------
+    filename, *files : str or os.PathLike
+        As for :func:`read_exo`.
+    original_order : bool, default: True
+        Must match the ``original_order`` the grid was read with: it decides
+        the ``cell_id`` values (see below).
+
+    Returns
+    -------
+    pyvista.MultiBlock
+        One :class:`pyvista.PolyData` per side set, in file order, keyed by the
+        set name; unnamed sets and repeated names get ``"side_set_<id>"``
+        (keys are unique). Every set holds *all* points of the mesh (the
+        points of :func:`read_exo`, shared between the sets without copying;
+        copy a set before modifying its points in place), so point ids index
+        the grid. Faces of 3D elements are polygons, edges of 2D elements are
+        lines (and ends of bars are vertices); for quadratic elements only the
+        corner nodes are used, ordered as by the Exodus library. When a set
+        mixes these kinds, PolyData stores vertices first, then lines, then
+        polygons; the cell data stays aligned with the cells. Cell data:
+
+        * ``exo_elem_id`` -- 1-based element index in *file order*, as stored
+          in the file's side set (not the element id map);
+        * ``exo_side`` -- 1-based Exodus side number;
+        * ``cell_id`` -- 0-based index of the element's cell in the grid
+          returned by :func:`read_exo` with the same ``original_order``;
+        * ``orig_elem_id`` and ``face_id`` -- deprecated aliases of
+          ``exo_elem_id`` and ``exo_side`` (exovista 1.x names).
+
+        Field data ``exo_side_set_id`` holds the Exodus side-set id.
+
+    Warns
+    -----
+    UserWarning
+        Entries on elements of skipped (unsupported) blocks or with invalid
+        side numbers are dropped with a warning.
+    """
+    with open_reader(filename, *files) as r:
+        layout = _Layout(r, original_order)
+        vtk_pts = pv.vtk_points(_points(r), deep=False, force_float=False)
+        return _side_sets(r, layout, vtk_pts)
+
+
+def read_node_sets(filename, *files):
+    """Read the node sets of an ExodusII file.
+
+    Parameters
+    ----------
+    filename, *files : str or os.PathLike
+        As for :func:`read_exo`.
+
+    Returns
+    -------
+    dict of str to numpy.ndarray
+        Node set name -> 0-based node indices (int64) into the points of
+        :func:`read_exo`, in file order. Unnamed sets and repeated names get
+        ``"node_set_<id>"`` (keys are unique).
+    """
+    with open_reader(filename, *files) as r:
+        sets = r.node_sets()
+    keys = _unique_keys([(s.id, s.name) for s in sets], "node_set")
+    return {key: s.nodes for key, s in zip(keys, sets)}
+
+
+def read_node_fields(filename, *files, names=None, combine_components=False):
+    """Read node-variable time histories without building the mesh.
+
+    Inverse of the ``node_fields`` argument of :func:`exovista.write_exo`.
+
+    Parameters
+    ----------
+    filename, *files : str or os.PathLike
+        As for :func:`read_exo`.
+    names : str or list of str, optional
+        Variables to read (default: all). Unknown names raise ``KeyError``.
+    combine_components : bool, default: False
+        Recombine component variables as in :func:`read_exo`.
+
+    Returns
+    -------
+    dict of str to numpy.ndarray
+        ``(n_steps, n_nodes)`` float64 arrays, or ``(n_steps, n_nodes,
+        n_components)`` for combined arrays. Columns follow the points of
+        :func:`read_exo`.
+    """
+    with open_reader(filename, *files) as r:
+        plan = _select(
+            _plan(r.node_var_names(), combine_components), _names(names), "node"
+        )
+        shape = (r.num_steps, r.num_nodes)
+        out = {}
+        for out_name, components in plan:
+            values = [_history(r.node_var(name), shape) for name in components]
+            out[out_name] = _stack(values, components, out_name)
+        return out
+
+
+def read_element_fields(
+    filename, *files, names=None, combine_components=False, original_order=True
+):
+    """Read element-variable time histories without building the mesh.
+
+    Inverse of the ``element_fields`` argument of :func:`exovista.write_exo`.
+
+    Parameters
+    ----------
+    filename, *files : str or os.PathLike
+        As for :func:`read_exo`.
+    names : str or list of str, optional
+        Variables to read (default: all). Unknown names raise ``KeyError``.
+    combine_components : bool, default: False
+        Recombine component variables as in :func:`read_exo`.
+    original_order : bool, default: True
+        As for :func:`read_exo`: columns are in the cell order of the grid
+        :func:`read_exo` returns with the same ``original_order`` (for files
+        written by :func:`exovista.write_exo`, the original cell order).
+
+    Returns
+    -------
+    dict of str to numpy.ndarray
+        ``(n_steps, n_cells)`` float64 arrays, or ``(n_steps, n_cells,
+        n_components)`` for combined arrays; NaN on blocks a variable is not
+        defined on. Elements of unsupported blocks (skipped by
+        :func:`read_exo`, with a warning) are skipped here too.
+    """
+    with open_reader(filename, *files) as r:
+        layout = _Layout(r, original_order)
+        plan = _select(
+            _plan(r.elem_var_names(), combine_components), _names(names), "element"
+        )
+        out = {}
+        for out_name, components in plan:
+            values = [layout.cell_values(r, name, None) for name in components]
+            out[out_name] = _stack(values, components, out_name)
+        return out
+
+
+def read_global_fields(filename, *files, names=None):
+    """Read global-variable time histories.
+
+    Parameters
+    ----------
+    filename, *files : str or os.PathLike
+        As for :func:`read_exo`.
+    names : str or list of str, optional
+        Variables to read (default: all). Unknown names raise ``KeyError``.
+
+    Returns
+    -------
+    dict of str to numpy.ndarray
+        ``(n_steps,)`` float64 arrays.
+    """
+    with open_reader(filename, *files) as r:
+        plan = _select(_plan(r.global_var_names(), False), _names(names), "global")
+        n_steps = r.num_steps
+        return {
+            out_name: _history(r.global_var(name), (n_steps,))
+            for out_name, (name,) in plan
+        }
+
+
+# --------------------------------------------------------------------------- #
+# Element blocks and cell order
+# --------------------------------------------------------------------------- #
+def _is_legacy_1x(r: ExodusReader) -> bool:
+    """True for a file written by exovista 1.x (always float32, fixed title)."""
+    return r.title == "pyvista_mesh" and r.float_word_size == 4
+
+
+class _Layout:
+    """The element blocks of a file and the order of the cells read_exo builds.
+
+    Cells are the elements of the supported, non-empty blocks. "Kept-file
+    order" is the file order restricted to those elements; :attr:`perm`
+    reorders it into the output order (None: identity).
+    """
+
+    def __init__(self, r: ExodusReader, original_order: bool):
+        self.num_dim = r.num_dim
+        self.legacy = _is_legacy_1x(r)
+        self.blocks = r.blocks()
+        sizes = np.array([b.n_elem for b in self.blocks], dtype=np.int64)
+        self.offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+        self.num_elem = int(self.offsets[-1])
+
+        # resolved cell type, and the type whose side table side sets use
+        self.types: list[ExoType | None] = []
+        self.side_types: list[ExoType | None] = []
+        skipped = []
+        for block in self.blocks:
+            info = None
+            if block.n_elem:
+                info = resolve_exo_type(
+                    block.elem_type, block.n_nodes_per_elem, self.num_dim
+                )
+                if info is None:
+                    skipped.append(block)
+            self.types.append(info)
+            self.side_types.append(self._side_type(block, info))
+        if skipped:
+            details = ", ".join(
+                f"{b.id} ({b.elem_type!r}, {b.n_nodes_per_elem} nodes, "
+                f"{b.n_elem} elements)"
+                for b in skipped
+            )
+            warnings.warn(
+                f"Skipping element block(s) of unsupported element type: "
+                f"{details}",
+                UserWarning,
+                stacklevel=3,
+            )
+
+        self.kept = [k for k, info in enumerate(self.types) if info is not None]
+        self.elem_ids = self._element_ids(r)
+        if len(self.kept) == sum(1 for b in self.blocks if b.n_elem):
+            kept_file = np.arange(self.num_elem, dtype=np.int64)
+        else:
+            kept_file = np.concatenate(
+                [np.zeros(0, np.int64)]
+                + [
+                    np.arange(self.offsets[k], self.offsets[k + 1], dtype=np.int64)
+                    for k in self.kept
+                ]
+            )
+        self.perm = None
+        if original_order and _is_permutation(self.elem_ids):
+            ids = self.elem_ids[kept_file]
+            if ids.size > 1 and not np.all(ids[1:] > ids[:-1]):
+                self.perm = np.argsort(ids, kind="stable")
+        #: file index (0-based) of each output cell
+        self.cell_file_index = kept_file if self.perm is None else kept_file[
+            self.perm
+        ]
+        self._cell_of_file = None
+
+    def _side_type(self, block, info):
+        if info is None:
+            return None
+        if (
+            self.legacy
+            and info.family == "TRISHELL"
+            and not block.elem_type.upper().startswith("TRISHELL")
+        ):
+            # exovista 1.x wrote 2D triangle meshes as TRI3 in 3D files but
+            # numbered their sides as triangle edges.
+            return resolve_exo_type(block.elem_type, block.n_nodes_per_elem, 2)
+        return info
+
+    def _element_ids(self, r: ExodusReader) -> np.ndarray:
+        ids = r.elem_id_map()
+        if ids is not None and ids.shape != (self.num_elem,):
+            warnings.warn(
+                f"Ignoring the element id map: it has {ids.size} entries for "
+                f"{self.num_elem} elements",
+                UserWarning,
+                stacklevel=4,
+            )
+            ids = None
+        if ids is None:
+            return np.arange(1, self.num_elem + 1, dtype=np.int64)
+        return np.asarray(ids, dtype=np.int64)
+
+    @property
+    def n_cells(self) -> int:
+        return int(self.cell_file_index.size)
+
+    @property
+    def cell_of_file(self) -> np.ndarray:
+        """Output cell index of each file element (-1 for skipped elements)."""
+        if self._cell_of_file is None:
+            out = np.full(self.num_elem, -1, dtype=np.int64)
+            out[self.cell_file_index] = np.arange(self.n_cells, dtype=np.int64)
+            self._cell_of_file = out
+        return self._cell_of_file
+
+    def _ordered(self, values: np.ndarray, axis: int = 0) -> np.ndarray:
+        """Reorder an array over kept-file-ordered cells to output order."""
+        if self.perm is None:
+            return values
+        return np.take(values, self.perm, axis=axis)
+
+    def per_block(self, values) -> np.ndarray:
+        """Per-cell array (output order) from one value per kept block."""
+        counts = [self.blocks[k].n_elem for k in self.kept]
+        return self._ordered(np.repeat(np.asarray(values), counts))
+
+    def cell_values(self, r: ExodusReader, name: str, step) -> np.ndarray:
+        """Element variable over all cells (output order); NaN if undefined.
+
+        ``(n_cells,)`` at a 0-based ``step``, ``(n_steps, n_cells)`` for None.
+        """
+        n_steps = r.num_steps
+        chunks = []
+        for k in self.kept:
+            block = self.blocks[k]
+            values = r.elem_var(name, block.id, step)
+            shape = (block.n_elem,) if step is not None else (n_steps, block.n_elem)
+            if values is None:
+                chunks.append(np.full(shape, np.nan))
+            else:
+                chunks.append(_history(values, shape))
+        if not chunks:
+            shape = (0,) if step is not None else (n_steps, 0)
+            return np.zeros(shape)
+        values = np.concatenate(chunks, axis=-1)
+        return self._ordered(values, axis=values.ndim - 1)
+
+    def cells(self):
+        """VTK ``(offsets, connectivity, celltypes)`` of the output cells."""
+        conns = []
+        for k in self.kept:
+            info = self.types[k]
+            conn = self.blocks[k].conn
+            perm = info.exo_to_vtk
+            if tuple(perm) != tuple(range(len(perm))):
+                conn = conn[:, list(perm)]
+            conns.append(conn)
+        widths = {c.shape[1] for c in conns}
+        celltypes = self.per_block(
+            np.array([self.types[k].vtk_type for k in self.kept], dtype=np.uint8)
+        ).astype(np.uint8, copy=False)
+        n = self.n_cells
+        if not conns:
+            return np.zeros(1, np.int64), np.zeros(0, np.int64), celltypes
+        if len(widths) == 1:
+            width = widths.pop()
+            conn = conns[0] if len(conns) == 1 else np.concatenate(conns)
+            conn = self._ordered(conn)
+            offsets = np.arange(0, (n + 1) * width, width, dtype=np.int64)
+            return offsets, np.ascontiguousarray(conn, np.int64).reshape(-1), celltypes
+        # cells of different sizes: gather the output order from the file order
+        flat = np.concatenate([c.reshape(-1) for c in conns])
+        sizes = np.concatenate(
+            [np.full(c.shape[0], c.shape[1], dtype=np.int64) for c in conns]
+        )
+        starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+        if self.perm is not None:
+            sizes = sizes[self.perm]
+            starts = starts[self.perm]
+        offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+        if self.perm is not None:
+            flat = flat[np.repeat(starts - offsets[:-1], sizes) + np.arange(flat.size)]
+        return offsets, np.ascontiguousarray(flat, np.int64), celltypes
+
+
+def _is_permutation(ids: np.ndarray) -> bool:
+    """True if ``ids`` is a permutation of ``1..len(ids)``."""
+    n = ids.size
+    if n == 0 or ids.min() != 1 or ids.max() != n:
+        return False
+    return bool(np.all(np.bincount(ids - 1, minlength=n) == 1))
+
+
+def _points(r: ExodusReader) -> np.ndarray:
+    """Float64 ``(n_nodes, 3)`` points; lower dimensions are padded with 0."""
+    coords = np.asarray(r.coords(), dtype=np.float64)
+    if coords.ndim == 2 and coords.shape[1] == 3:
+        return np.ascontiguousarray(coords)
+    coords = coords.reshape(coords.shape[0], -1)
+    points = np.zeros((coords.shape[0], 3), dtype=np.float64)
+    points[:, : coords.shape[1]] = coords[:, :3]
     return points
 
 
-def _read_blocks(f):
-    """Parse element blocks once, in block-id order.
+def _build_grid(layout: _Layout, vtk_pts) -> pv.UnstructuredGrid:
+    grid = pv.UnstructuredGrid()
+    grid.SetPoints(vtk_pts)
+    offsets, connectivity, celltypes = layout.cells()
+    if layout.n_cells:
+        cell_array = pv.CellArray.from_arrays(offsets, connectivity, deep=False)
+        grid.SetCells(numpy_to_vtk(celltypes, deep=True), cell_array)
 
-    Returns a list of dicts with the block ``id``, ``name``, resolved VTK
-    ``vtk_type``, 0-based ``conn`` array, and the ``start`` global element
-    offset (so 1-based Exodus element ids map back to a block and local row).
-    """
-    block_ids = f.get_element_block_ids()
-    if block_ids is None:
-        block_ids = []
-
-    blocks = []
-    start = 0
-    for block_id in block_ids:
-        block = f.get_element_block(block_id)
-        if block is None or block.num_block_elems == 0:
-            continue
-        conn = np.asarray(f.get_element_conn(block_id), dtype=np.int64)
-        conn = conn.reshape(block.num_block_elems, block.num_elem_nodes) - 1
-        blocks.append({
-            "id": block_id,
-            "name": str(block.name),
-            "vtk_type": _resolve_vtk_cell_type(block.elem_type),
-            "conn": conn,
-            "start": start,
-        })
-        start += conn.shape[0]
-    return blocks
-
-
-def _build_grid(f, points, blocks, time_step,
-                read_node_variables, read_element_variables):
-    cells = []
-    cell_types = []
-    cell_block_ids = []
-    cell_block_names = []
-
-    for block in blocks:
-        conn0 = block["conn"]
-        n_cells = conn0.shape[0]
-        n_per = conn0.shape[1]
-        prefixed = np.hstack(
-            [np.full((n_cells, 1), n_per, dtype=np.int64), conn0]
-        )
-        cells.append(prefixed.ravel())
-        cell_types.append(np.full(n_cells, int(block["vtk_type"]), dtype=np.uint8))
-        cell_block_ids.append(np.full(n_cells, block["id"], dtype=np.int64))
-        cell_block_names.extend([block["name"]] * n_cells)
-
-    if cells:
-        grid = pv.UnstructuredGrid(
-            np.concatenate(cells), np.concatenate(cell_types), points
-        )
-        grid.cell_data["exo_block_id"] = np.concatenate(cell_block_ids)
-        grid.cell_data["exo_block_name"] = np.array(cell_block_names, dtype=object)
-    else:
-        # No elements: return a point cloud so downstream code still has points.
-        grid = pv.UnstructuredGrid(
-            np.empty(0, dtype=np.int64), np.empty(0, dtype=np.uint8), points
-        )
-
-    times = f.get_times()
-    times = np.asarray([]) if times is None else np.asarray(times, dtype=float)
-    grid.field_data["times"] = times
-    grid.field_data["num_dim"] = np.array([f.num_dimensions()])
-
-    if read_node_variables:
-        _read_node_variables(f, grid, time_step, select=read_node_variables)
-    if read_element_variables and cells:
-        ordered_blocks = [(b["id"], b["conn"].shape[0]) for b in blocks]
-        _read_element_variables(
-            f, grid, time_step, ordered_blocks, select=read_element_variables
-        )
-
+    blocks = [layout.blocks[k] for k in layout.kept]
+    grid.cell_data["exo_block_id"] = layout.per_block(
+        np.array([b.id for b in blocks], dtype=np.int64)
+    ).astype(np.int64, copy=False)
+    block_index = layout.per_block(np.arange(len(blocks), dtype=np.int64))
+    grid.GetCellData().AddArray(
+        _string_array("exo_block_name", [b.name for b in blocks], block_index)
+    )
+    grid.cell_data["exo_elem_id"] = layout.elem_ids[layout.cell_file_index]
     return grid
 
 
-def _exo_face_local_nodes(vtk_type, side_id):
-    """Local node indices of Exodus side ``side_id`` (1-based) for ``vtk_type``.
+def _string_array(name: str, values: list[str], index: np.ndarray) -> vtkStringArray:
+    """A vtkStringArray holding ``values[index[i]]`` at ``i``.
 
-    Reuses the face tables from :mod:`exovista.write_pyvista`, reordered from VTK
-    to Exodus side ordering, so reading is the exact inverse of writing.
+    Built with one VTK call per run of equal values (copied from a template
+    filled by doubling), not one per entry: far faster for per-cell block
+    names, which come in long runs. Unlike pyvista's string conversion this
+    also accepts non-ASCII names.
     """
-    vtk_faces = _vtk_face_nodes[vtk_type]
-    face_order = vtk2exo_faceorder[vtk_type]
-    ordered_faces = [vtk_faces[i] for i in face_order]
-    return ordered_faces[side_id - 1]
+    n = int(index.size)
+    out = vtkStringArray()
+    out.SetName(name)
+    out.SetNumberOfValues(n)
+    if n == 0:
+        return out
+    starts = np.flatnonzero(np.concatenate([[True], index[1:] != index[:-1]]))
+    lengths = np.diff(np.concatenate([starts, [n]]))
+    run_values = index[starts]
+    longest = np.zeros(len(values), dtype=np.int64)
+    np.maximum.at(longest, run_values, lengths)
+    templates = {}
+    for value in np.flatnonzero(longest).tolist():
+        template = vtkStringArray()
+        size = int(longest[value])
+        template.SetNumberOfValues(size)
+        template.SetValue(0, str(values[value]))
+        filled = 1
+        while filled < size:
+            count = min(filled, size - filled)
+            template.InsertTuples(filled, count, 0, template)
+            filled += count
+        templates[value] = template
+    for start, length, value in zip(
+        starts.tolist(), lengths.tolist(), run_values.tolist()
+    ):
+        out.InsertTuples(start, length, 0, templates[value])
+    return out
 
 
-def _reconstruct_side_sets(f, points, blocks):
-    """Rebuild each side set as a PolyData of faces over the volume nodes."""
-    side_sets = pv.MultiBlock()
-    set_ids = f.get_side_set_ids()
-    if set_ids is None:
-        return side_sets
-
-    # Block lookup by global (0-based) element index.
-    starts = np.array([b["start"] for b in blocks], dtype=np.int64)
-
-    for set_id in set_ids:
-        ss = f.get_side_set(set_id)
-        elems = np.asarray(ss.elems, dtype=np.int64)   # 1-based global elem ids
-        sides = np.asarray(ss.sides, dtype=np.int64)   # 1-based local side ids
-
-        faces = []
-        face_lengths = []
-        for elem_id, side_id in zip(elems, sides):
-            e0 = elem_id - 1
-            bidx = int(np.searchsorted(starts, e0, side="right") - 1)
-            block = blocks[bidx]
-            local_row = e0 - block["start"]
-            local_nodes = _exo_face_local_nodes(block["vtk_type"], side_id)
-            global_nodes = block["conn"][local_row][list(local_nodes)]
-            faces.append(global_nodes)
-            face_lengths.append(len(local_nodes))
-
-        poly = _faces_to_polydata(points, faces, face_lengths)
-        poly.cell_data["orig_elem_id"] = elems
-        poly.cell_data["face_id"] = sides
-        side_sets[ss.name] = poly
-
-    return side_sets
+# --------------------------------------------------------------------------- #
+# Sets
+# --------------------------------------------------------------------------- #
+def _unique_keys(sets: Iterable[tuple[int, str]], prefix: str) -> list[str]:
+    """Unique keys for ``(id, name)`` sets: name, else ``f"{prefix}_{id}"``."""
+    keys: list[str] = []
+    used: set[str] = set()
+    for set_id, name in sets:
+        key = name
+        if not key or key in used:
+            key = default = f"{prefix}_{set_id}"
+            k = 1
+            while key in used:
+                key = f"{default}_{k}"
+                k += 1
+        used.add(key)
+        keys.append(key)
+    return keys
 
 
-def _faces_to_polydata(points, faces, face_lengths):
-    """Build a PolyData from face node lists over the shared ``points`` array.
+def _side_sets(r: ExodusReader, layout: _Layout, vtk_pts) -> pv.MultiBlock:
+    sets = r.side_sets()
+    keys = _unique_keys([(s.id, s.name) for s in sets], "side_set")
+    out = pv.MultiBlock()
+    for key, ss in zip(keys, sets):
+        out[key] = _side_set_mesh(ss, layout, vtk_pts, key)
+    return out
 
-    2-node faces (2D element edges) become lines; 3+ node faces become polygons.
+
+def _side_set_mesh(ss, layout: _Layout, vtk_pts, key: str) -> pv.PolyData:
+    elems = ss.elems
+    sides = ss.sides
+    n = elems.size
+    block_of = np.searchsorted(layout.offsets, elems, side="right") - 1
+    in_range = (elems >= 0) & (elems < layout.num_elem)
+    sizes = np.zeros(n, dtype=np.int64)
+    valid = np.zeros(n, dtype=bool)
+    problems = []
+    dropped = 0
+
+    # Group entries by (block, side): one vectorized gather per group.
+    groups = []
+    for k in np.unique(block_of[in_range]).tolist():
+        in_block = np.flatnonzero(in_range & (block_of == k))
+        info = layout.side_types[k]
+        block = layout.blocks[k]
+        if info is None or not info.sides:
+            dropped += in_block.size
+            problems.append(
+                f"{in_block.size} on block {block.id} (element type "
+                f"{block.elem_type!r} has no supported sides)"
+            )
+            continue
+        local = elems[in_block] - layout.offsets[k]
+        block_sides = sides[in_block]
+        for side in np.unique(block_sides).tolist():
+            sel = block_sides == side
+            if not 1 <= side <= info.n_sides:
+                dropped += int(sel.sum())
+                problems.append(
+                    f"{int(sel.sum())} with side {side} on block {block.id} "
+                    f"({info.name} has {info.n_sides} sides)"
+                )
+                continue
+            entries = in_block[sel]
+            nodes = block.conn[np.ix_(local[sel], info.sides[side - 1])]
+            sizes[entries] = nodes.shape[1]
+            valid[entries] = True
+            groups.append((entries, nodes))
+    if np.any(~in_range):
+        dropped += int((~in_range).sum())
+        problems.append(
+            f"{int((~in_range).sum())} on elements outside 1..{layout.num_elem}"
+        )
+    if problems:
+        warnings.warn(
+            f"Side set {ss.id} ({key!r}): dropping {dropped} of {n} entries: "
+            + "; ".join(problems),
+            UserWarning,
+            stacklevel=4,
+        )
+
+    offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+    flat = np.zeros(offsets[-1], dtype=np.int64)
+    for entries, nodes in groups:
+        width = nodes.shape[1]
+        flat[offsets[entries][:, None] + np.arange(width)] = nodes
+
+    # PolyData keeps vertices, then lines, then polygons; order entries so.
+    kind = np.minimum(sizes, 3)
+    keep = np.flatnonzero(valid)
+    keep = keep[np.argsort(kind[keep], kind="stable")]
+
+    mesh = pv.PolyData()
+    mesh.SetPoints(vtk_pts)
+    setters = {1: mesh.SetVerts, 2: mesh.SetLines, 3: mesh.SetPolys}
+    for k, setter in setters.items():
+        entries = keep[kind[keep] == k]
+        if not entries.size:
+            continue
+        cell_sizes = sizes[entries]
+        cell_offsets = np.concatenate([[0], np.cumsum(cell_sizes)]).astype(np.int64)
+        starts = offsets[entries]
+        conn = flat[
+            np.repeat(starts - cell_offsets[:-1], cell_sizes)
+            + np.arange(cell_offsets[-1])
+        ]
+        setter(pv.CellArray.from_arrays(cell_offsets, conn, deep=False))
+
+    elem_ids = elems[keep] + 1
+    side_ids = sides[keep].copy()
+    mesh.cell_data["exo_elem_id"] = elem_ids
+    mesh.cell_data["exo_side"] = side_ids
+    mesh.cell_data["cell_id"] = layout.cell_of_file[elems[keep]]
+    # deprecated exovista 1.x names
+    mesh.cell_data["orig_elem_id"] = elem_ids.copy()
+    mesh.cell_data["face_id"] = side_ids.copy()
+    mesh.field_data["exo_side_set_id"] = np.array([ss.id])
+    return mesh
+
+
+# --------------------------------------------------------------------------- #
+# Variables
+# --------------------------------------------------------------------------- #
+def _read_times(r: ExodusReader, legacy: bool) -> np.ndarray:
+    times = np.asarray(r.times(), dtype=np.float64)
+    unwritten = times == _NETCDF_FLOAT_FILL
+    if np.any(unwritten):
+        # exovista 1.x left the time of its single static step unwritten
+        times = times.copy()
+        times[unwritten] = 0.0 if legacy else np.nan
+    return times
+
+
+def _resolve_step(time_step, n_steps: int):
+    """1-based / negative ``time_step`` -> 0-based index (None: no steps)."""
+    if isinstance(time_step, (bool, np.bool_)):
+        raise TypeError("time_step must be an integer, not a bool")
+    try:
+        ts = operator.index(time_step)
+    except TypeError:
+        raise TypeError(
+            f"time_step must be an integer, got {type(time_step).__name__}"
+        ) from None
+    if ts == 0:
+        raise IndexError(
+            "time_step is 1-based: use 1 for the first step and -1 for the last"
+        )
+    if n_steps == 0:
+        return None
+    index = ts - 1 if ts > 0 else n_steps + ts
+    if not 0 <= index < n_steps:
+        raise IndexError(
+            f"time_step {ts} is out of range: the file has {n_steps} time "
+            f"step(s) (valid: 1..{n_steps} or -{n_steps}..-1)"
+        )
+    return index
+
+
+def _history(values, shape) -> np.ndarray:
+    """``values`` as a float64 array of ``shape`` (empty histories allowed)."""
+    if values is None:
+        return np.zeros(shape)
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0 and int(np.prod(shape)) == 0:
+        return np.zeros(shape)
+    return values.reshape(shape)
+
+
+def _component_groups(names: list[str]) -> dict[str, list[str]]:
+    """Base name -> component variable names (exovista's suffix convention).
+
+    A group is returned only if its suffixes are exactly
+    ``component_suffixes(n)`` for its size ``n >= 2`` and the base name is not
+    itself a variable. Components are ordered by that convention.
     """
-    if not faces:
-        return pv.PolyData(points)
+    candidates: dict[str, dict[str, str]] = {}
+    for name in names:
+        base, sep, suffix = name.rpartition("_")
+        if not base or not sep:
+            continue
+        if suffix not in _LETTER_SUFFIXES and not (
+            suffix.isascii() and suffix.isdigit() and str(int(suffix)) == suffix
+        ):
+            continue
+        candidates.setdefault(base, {})["_" + suffix] = name
+    existing = set(names)
+    groups = {}
+    for base, by_suffix in candidates.items():
+        n = len(by_suffix)
+        if n < 2 or base in existing:
+            continue
+        expected = component_suffixes(n)
+        if set(expected) == set(by_suffix):
+            groups[base] = [by_suffix[s] for s in expected]
+    return groups
 
-    lines = []
-    polys = []
-    for nodes, length in zip(faces, face_lengths):
-        cell = [length, *[int(n) for n in nodes]]
-        if length == 2:
-            lines.extend(cell)
-        else:
-            polys.extend(cell)
 
-    # Pass cells through the constructor so PolyData does not auto-generate a
-    # vertex cell for every point (which would inflate the cell count).
-    kwargs = {}
-    if polys:
-        kwargs["faces"] = np.array(polys, dtype=np.int64)
-    if lines:
-        kwargs["lines"] = np.array(lines, dtype=np.int64)
-    return pv.PolyData(points, **kwargs)
+def _plan(names: list[str], combine: bool) -> list[tuple[str, tuple[str, ...]]]:
+    """``(output name, component names)`` per output array, in file order."""
+    if not combine:
+        return [(name, (name,)) for name in names]
+    groups = _component_groups(names)
+    position = {name: i for i, name in enumerate(names)}
+    first = {}
+    member = set()
+    for base, components in groups.items():
+        member.update(components)
+        first[min(components, key=position.__getitem__)] = base
+    plan = []
+    for name in names:
+        if name in first:
+            base = first[name]
+            plan.append((base, tuple(groups[base])))
+        elif name not in member:
+            plan.append((name, (name,)))
+    return plan
 
 
-def _normalize_selection(select, available):
-    """Resolve a ``True``/``False``/``str``/list selection of variable names.
+def _names(names):
+    """``names=None`` of the read_*_fields functions means all variables."""
+    return True if names is None else names
 
-    ``True`` selects every available name, ``False``/``None`` selects nothing,
-    and a name or iterable of names selects exactly those (preserving the
-    caller's order). Names not present in ``available`` raise ``KeyError`` so a
-    typo fails loudly instead of silently reading nothing.
-    """
-    available = [] if available is None else [str(n) for n in available]
+
+def _select(plan, select, kind: str):
+    """Entries of ``plan`` chosen by ``select`` (True/False/None/str/list)."""
     if select is True:
-        return available
+        return list(plan)
     if select is False or select is None:
         return []
-    requested = [select] if isinstance(select, str) else [str(n) for n in select]
-    missing = [n for n in requested if n not in available]
-    if missing:
-        raise KeyError(
-            f"Variable(s) {missing} not found; available names are {available}"
-        )
-    return requested
-
-
-def _read_node_variables(f, grid, time_step, select=True):
-    names = _normalize_selection(select, f.get_node_variable_names())
-    for name in names:
-        values = f.get_node_variable_values(name, time_step=time_step)
-        if values is None:
+    requested = [select] if isinstance(select, str) else list(select)
+    by_name = {out_name: (out_name, comps) for out_name, comps in plan}
+    scalars = {c for _, comps in plan for c in comps}
+    chosen, missing, seen = [], [], set()
+    for name in requested:
+        name = str(name)
+        if name in seen:
             continue
-        values = np.asarray(values)
-        if values.shape[0] == grid.n_points:
-            grid.point_data[str(name)] = values
+        seen.add(name)
+        if name in by_name:
+            chosen.append(by_name[name])
+        elif name in scalars:
+            chosen.append((name, (name,)))
+        else:
+            missing.append(name)
+    if missing:
+        available = list(by_name) + sorted(scalars - set(by_name))
+        raise KeyError(
+            f"{kind} variable(s) {missing} not found; available: {available}"
+        )
+    return chosen
 
 
-def _read_element_variables(f, grid, time_step, ordered_blocks, select=True):
-    names = _normalize_selection(select, f.get_element_variable_names())
-    for name in names:
-        chunks = []
-        for block_id, n_block_cells in ordered_blocks:
-            values = f.get_element_variable_values(
-                block_id, name, time_step=time_step
-            )
-            if values is None:
-                # Variable not defined on this block (truth table); pad with NaN
-                # so the concatenated array stays aligned with the cells.
-                chunks.append(np.full(n_block_cells, np.nan))
-            else:
-                chunks.append(np.asarray(values, dtype=float))
-        if chunks:
-            combined = np.concatenate(chunks)
-            if combined.shape[0] == grid.n_cells:
-                grid.cell_data[str(name)] = combined
+def _drop_reserved(plan, reserved, kind: str):
+    clashing = [out_name for out_name, _ in plan if out_name in reserved]
+    if not clashing:
+        return plan
+    where = "read_global_fields" if kind == "global" else "read_element_fields"
+    warnings.warn(
+        f"Not storing {kind} variable(s) {clashing} in the grid: the name is "
+        f"reserved by read_exo; use exovista.{where} to read them",
+        UserWarning,
+        stacklevel=3,
+    )
+    return [(out_name, comps) for out_name, comps in plan if out_name not in reserved]
 
 
-def read_node_fields(filename, *files, names=None):
-    """Read node-variable time histories from an Exodus file.
-
-    Inverse of the ``node_fields`` argument to :func:`exovista.write_exo`. The
-    mesh (coordinates, connectivity) is *not* reconstructed, so this is the
-    lightweight way to pull a transient field's full history out of a file.
-
-    Parameters
-    ----------
-    filename : str
-        Path to the ExodusII file. For a parallel decomposition pass the
-        remaining parts as additional positional arguments.
-    *files : str
-        Additional file parts of a parallel decomposition.
-    names : str or list of str, optional
-        Name or list of names to read. ``None`` (default) reads every node
-        variable. Unknown names raise ``KeyError``.
-
-    Returns
-    -------
-    dict of {str: ndarray}
-        Maps each variable name to an array of shape ``(num_times, num_nodes)``
-        -- the same layout :func:`write_exo` accepts in ``node_fields``.
-    """
-    f = _open(filename, *files)
-    try:
-        select = True if names is None else names
-        wanted = _normalize_selection(select, f.get_node_variable_names())
-        out = {}
-        for name in wanted:
-            values = f.get_node_variable_values(name, time_step=None)
-            if values is not None:
-                out[str(name)] = np.asarray(values)
-        return out
-    finally:
-        f.close()
-
-
-def read_element_fields(filename, *files, names=None):
-    """Read element-variable time histories from an Exodus file.
-
-    Inverse of the ``element_fields`` argument to :func:`exovista.write_exo`.
-    Element variables are stored per block with a truth table, so blocks are
-    concatenated in block-id order (NaN-padding any block on which a variable
-    is not defined) to reconstruct the global element ordering that
-    :func:`write_exo` accepted. The mesh itself is not reconstructed.
-
-    Parameters
-    ----------
-    filename : str
-        Path to the ExodusII file. For a parallel decomposition pass the
-        remaining parts as additional positional arguments.
-    *files : str
-        Additional file parts of a parallel decomposition.
-    names : str or list of str, optional
-        Name or list of names to read. ``None`` (default) reads every element
-        variable. Unknown names raise ``KeyError``.
-
-    Returns
-    -------
-    dict of {str: ndarray}
-        Maps each variable name to an array of shape ``(num_times, num_elems)``
-        -- the same layout :func:`write_exo` accepts in ``element_fields``.
-    """
-    f = _open(filename, *files)
-    try:
-        select = True if names is None else names
-        wanted = _normalize_selection(select, f.get_element_variable_names())
-        if not wanted:
-            return {}
-
-        block_ids = f.get_element_block_ids()
-        block_ids = [] if block_ids is None else list(block_ids)
-        block_sizes = []
-        for block_id in block_ids:
-            block = f.get_element_block(block_id)
-            block_sizes.append(0 if block is None else block.num_block_elems)
-        num_times = f.num_times()
-
-        out = {}
-        for name in wanted:
-            chunks = []
-            for block_id, n_block_cells in zip(block_ids, block_sizes):
-                if n_block_cells == 0:
-                    continue
-                values = f.get_element_variable_values(
-                    block_id, name, time_step=None
-                )
-                if values is None:
-                    # Not defined on this block (truth table); pad with NaN so
-                    # the columns stay aligned with the global element order.
-                    chunks.append(np.full((num_times, n_block_cells), np.nan))
-                else:
-                    chunks.append(np.asarray(values, dtype=float))
-            if chunks:
-                out[str(name)] = np.concatenate(chunks, axis=1)
-        return out
-    finally:
-        f.close()
+def _stack(values: list[np.ndarray], components, out_name) -> np.ndarray:
+    """One scalar array, or the components stacked along a last axis."""
+    if len(components) == 1 and out_name == components[0]:
+        return values[0]
+    return np.stack(values, axis=-1)

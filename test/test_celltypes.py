@@ -307,6 +307,19 @@ def test_exo_type_for():
     assert ct.exo_type_for(pv.CellType.QUADRATIC_PYRAMID, 3) == "PYRAMID13"
 
 
+def test_written_names():
+    # meshio (<= 5.3) only reads the short names of these three types
+    short = {"TETRA4": "TETRA", "WEDGE6": "WEDGE", "PYRAMID5": "PYRAMID"}
+    for name, info in ct.EXO_TYPES.items():
+        assert info.written_name == short.get(name, name)
+        # every reader resolves the written name (plus node count) to the type
+        num_dim = {"TRI": 2, "TRISHELL": 3}.get(info.family)
+        assert ct.resolve_exo_type(info.written_name, info.n_nodes, num_dim) is info
+    for name, written in short.items():
+        # without a node count the short name is still the linear element
+        assert ct.resolve_exo_type(written) is ct.EXO_TYPES[name]
+
+
 @pytest.mark.parametrize(
     "vtk_type",
     [

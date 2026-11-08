@@ -1,6 +1,5 @@
 """Smoke tests for the exoread command-line interface (exovista.exoread)."""
 import io
-import logging
 import os
 
 import numpy as np
@@ -9,8 +8,6 @@ import pytest
 import exovista
 
 pv = pytest.importorskip("pyvista")
-
-logging.disable(logging.CRITICAL)
 
 
 def _write_sample(path):

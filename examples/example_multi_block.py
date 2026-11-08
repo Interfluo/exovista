@@ -1,43 +1,42 @@
+"""Write a hexahedral mesh split into element blocks by a region array.
 
-import pyvista as pv
+Also shows the two other ways to define blocks: a ``pyvista.MultiBlock``
+(one block per leaf, named after the leaf) and a string region array.
+"""
+
 import numpy as np
-import exovista
-import logging
+import pyvista as pv
 
-logging.basicConfig(level=logging.INFO)
+import exovista
+
 
 def main():
-    """
-    Example of saving a Multi-Block mesh defined by regions.
-    Also demonstrates saving Hex elements.
-    """
-    # Create two cubes side-by-side
-    # We can create a larger grid and split it via regions
-    # 4x2x2 grid of cells
-    # Use ImageData cast to UnstructuredGrid for Hex cells
+    # A 4 x 2 x 2 grid of hexahedra; left and right halves are two regions.
     grid = pv.ImageData(dimensions=(5, 3, 3)).cast_to_unstructured_grid()
-    
-    # Define regions based on x-coordinate
     centers = grid.cell_centers().points
-    regions = np.ones(grid.n_cells, dtype=int)
-    
-    # Left half is region 1, Right half is region 2
-    # x goes from 0 to 4
-    regions[centers[:, 0] > 2] = 2
-    
-    grid.cell_data["region"] = regions
-    
-    # Add some node data
+    grid.cell_data["region"] = np.where(centers[:, 0] > 2, 2, 1)
     grid.point_data["temperature"] = grid.points[:, 0] * 10
-    
-    # Save to EXO
-    output_filename = "example_multi_block_v2.exo"
-    logging.info(f"Saving Multi-Block Hex mesh to {output_filename}...")
-    # block_names argument is optional, currently write_exo generates names like block_0, block_1
-    # Check if we can pass names?
-    # Yes: block_names
-    exovista.write_exo(output_filename, grid, block_names=["left_material", "right_material"])
-    logging.info("Done.")
+
+    # block_names: a list in sorted region order, or a dict {region: name}
+    filename = "example_multi_block.exo"
+    exovista.write_exo(filename, grid,
+                       block_names=["left_material", "right_material"])
+    mesh = exovista.read_exo(filename)
+    print("region array :", sorted(set(mesh.cell_data["exo_block_name"])))
+
+    # a MultiBlock: each leaf becomes a block named after its key
+    left = grid.extract_cells(np.flatnonzero(grid.cell_data["region"] == 1))
+    right = grid.extract_cells(np.flatnonzero(grid.cell_data["region"] == 2))
+    exovista.write_exo(filename, pv.MultiBlock({"left": left, "right": right}))
+    mesh = exovista.read_exo(filename)
+    print("MultiBlock   :", sorted(set(mesh.cell_data["exo_block_name"])))
+
+    # string region values name the blocks directly
+    grid.cell_data["region"] = np.where(centers[:, 0] > 2, "aluminium", "copper")
+    exovista.write_exo(filename, grid)
+    mesh = exovista.read_exo(filename)
+    print("string region:", sorted(set(mesh.cell_data["exo_block_name"])))
+
 
 if __name__ == "__main__":
     main()

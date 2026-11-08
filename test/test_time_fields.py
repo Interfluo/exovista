@@ -1,11 +1,20 @@
 
-import unittest
-import pyvista as pv
-import numpy as np
-import exovista
+"""Time-varying fields written by write_exo, read back through the legacy
+``exovista.File`` API (1-based / negative ``time_step``) and the 2.0 readers.
+
+exovista 2.0 stores everything as float64, so values and times round-trip
+exactly (1.x stored float32), block ids are the region values, and a single
+static step gets the time 0.0 (1.x left it unwritten: 9.97e36).
+"""
 import os
-import tempfile
 import shutil
+import tempfile
+import unittest
+
+import numpy as np
+import pyvista as pv
+
+import exovista
 
 
 class TestTimeFields(unittest.TestCase):
@@ -47,7 +56,7 @@ class TestTimeFields(unittest.TestCase):
         f = exovista.File(out, mode="r")
         try:
             self.assertEqual(f.num_times(), 3)
-            np.testing.assert_allclose(f.get_times(), times)
+            np.testing.assert_array_equal(f.get_times(), times)
             self.assertIn("temperature", list(f.get_node_variable_names()))
             self.assertIn("pressure", list(f.get_element_variable_names()))
 
@@ -55,21 +64,28 @@ class TestTimeFields(unittest.TestCase):
                 vals = np.asarray(
                     f.get_node_variable_values("temperature", time_step=step)
                 )
-                np.testing.assert_allclose(vals, temperature[step - 1])
+                np.testing.assert_array_equal(vals, temperature[step - 1])
 
-            # Block 1 holds cell 0, block 2 holds cell 1.
+            # The block ids are the region values: block 1 holds cell 0,
+            # block 2 holds cell 1.
             block_ids = list(f.get_element_block_ids())
+            self.assertEqual(block_ids, [1, 2])
             for step in range(1, 4):
-                b1 = np.asarray(
-                    f.get_element_variable_values(block_ids[0], "pressure", time_step=step)
+                b1, b2 = (
+                    np.asarray(f.get_element_variable_values(
+                        block_id, "pressure", time_step=step))
+                    for block_id in block_ids
                 )
-                b2 = np.asarray(
-                    f.get_element_variable_values(block_ids[1], "pressure", time_step=step)
-                )
-                np.testing.assert_allclose(b1, [pressure[step - 1, 0]])
-                np.testing.assert_allclose(b2, [pressure[step - 1, 1]])
+                np.testing.assert_array_equal(b1, [pressure[step - 1, 0]])
+                np.testing.assert_array_equal(b2, [pressure[step - 1, 1]])
         finally:
             f.close()
+
+        # the 2.0 readers see the same history
+        grid = exovista.read_exo(out, time_step=2)
+        np.testing.assert_array_equal(grid.point_data["temperature"], temperature[1])
+        np.testing.assert_array_equal(grid.cell_data["pressure"], pressure[1])
+        np.testing.assert_array_equal(grid.field_data["times"], times)
 
     def test_time_step_indexing(self):
         # 1-based positive, Python-style negative-from-end, and 0 is invalid.
@@ -100,7 +116,8 @@ class TestTimeFields(unittest.TestCase):
             )
             block_ids = list(f.get_element_block_ids())
             np.testing.assert_allclose(
-                f.get_element_variable_values(block_ids[0], "pressure", time_step=-2),
+                f.get_element_variable_values(
+                    block_ids[0], "pressure", time_step=-2),
                 [pressure[1, 0]],
             )
             # 0 is not a valid 1-based step: it must raise, not return the last.
@@ -110,6 +127,13 @@ class TestTimeFields(unittest.TestCase):
                 f.get_element_variable_values(block_ids[0], "pressure", time_step=0)
         finally:
             f.close()
+        # read_exo has the same time_step semantics
+        np.testing.assert_array_equal(
+            exovista.read_exo(out, time_step=-2).point_data["temperature"],
+            temperature[1],
+        )
+        with self.assertRaises(IndexError):
+            exovista.read_exo(out, time_step=0)
 
     def test_read_field_mirror_functions(self):
         times = np.array([0.0, 0.5, 1.0])
@@ -172,8 +196,9 @@ class TestTimeFields(unittest.TestCase):
         f = exovista.File(out, mode="r")
         try:
             self.assertEqual(f.num_times(), 1)
+            np.testing.assert_array_equal(f.get_times(), [0.0])
             vals = np.asarray(f.get_node_variable_values("height", time_step=1))
-            np.testing.assert_allclose(vals, node_vals)
+            np.testing.assert_array_equal(vals, node_vals)
         finally:
             f.close()
 
@@ -185,6 +210,7 @@ class TestTimeFields(unittest.TestCase):
                 times=np.array([0.0, 1.0]),
                 node_fields={"temperature": np.zeros((3, self.grid.n_points))},
             )
+        self.assertFalse(os.path.exists(out))  # nothing written on error
 
 
 if __name__ == "__main__":

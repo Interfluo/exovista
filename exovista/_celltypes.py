@@ -2,7 +2,9 @@
 
 This module knows, for every element type exovista supports:
 
-* the canonical Exodus element-type name written to disk (e.g. ``"HEX20"``);
+* its canonical Exodus element-type name (e.g. ``"HEX20"``) and the name
+  written to disk (the same, except ``TETRA``, ``WEDGE`` and ``PYRAMID`` for
+  the linear tetrahedron, wedge and pyramid; see :attr:`ExoType.written_name`);
 * the Exodus names accepted when reading (case-insensitive; e.g. ``HEX``,
   ``HEX8``, ``HEXAHEDRON``; the node count decides the order, as in Exodus);
 * the VTK cell type produced on read;
@@ -98,7 +100,8 @@ class ExoType:
     Attributes
     ----------
     name : str
-        Canonical Exodus element-type name written to disk (e.g. ``"HEX8"``).
+        Canonical Exodus element-type name (e.g. ``"HEX8"``), the key of
+        :data:`EXO_TYPES`. :attr:`written_name` is what exovista writes.
     family : str
         Exodus topology family (``"HEX"``, ``"TRI"``, ``"SHELL"``, ...).
     n_nodes : int
@@ -136,6 +139,18 @@ class ExoType:
         """Number of Exodus sides."""
         return len(self.sides)
 
+    @property
+    def written_name(self) -> str:
+        """Element-type name exovista writes to disk for this type.
+
+        :attr:`name`, except ``TETRA``, ``WEDGE`` and ``PYRAMID`` for
+        ``TETRA4``, ``WEDGE6`` and ``PYRAMID5``. Every Exodus reader (the
+        Exodus library, VTK, SEACAS/IOSS, libMesh) identifies a type by its
+        first three letters plus the node count, so both spellings are the
+        same element; meshio (<= 5.3) reads only the short ones.
+        """
+        return _WRITTEN_NAMES.get(self.name, self.name)
+
 
 def _identity(n: int) -> tuple[int, ...]:
     return tuple(range(n))
@@ -143,7 +158,7 @@ def _identity(n: int) -> tuple[int, ...]:
 
 # --------------------------------------------------------------------------- #
 # Exodus side tables (corner nodes, Exodus local order, 0-based, per 1-based
-# side). The linear 3D tables are the ones previously verified in
+# side). The linear 3D tables are the ones verified in exovista 1.x's
 # write_pyvista.py (``_vtk_face_nodes`` reordered by ``vtk2exo_faceorder``),
 # written here in Exodus node order. They agree with the SEACAS Exodus
 # ``ex_get_side_set_node_list`` tables.
@@ -170,6 +185,12 @@ _SHELL_SIDES = ((0, 1, 2, 3), (0, 3, 2, 1), (0, 1), (1, 2), (2, 3), (3, 0))
 _BAR_SIDES = ((0,), (1,))
 # BEAM: the element itself, with opposite orientations.
 _BEAM_SIDES = ((0, 1), (1, 0))
+
+# Names written to disk where they differ from the canonical name: meshio
+# (<= 5.3) cannot read TETRA4 (it maps it to an unknown "tetra4" cell type),
+# WEDGE6 or PYRAMID5, but reads TETRA, WEDGE and PYRAMID, which every Exodus
+# reader resolves to the same elements (first three letters + node count).
+_WRITTEN_NAMES = {"TETRA4": "TETRA", "WEDGE6": "WEDGE", "PYRAMID5": "PYRAMID"}
 
 # Exodus -> VTK node permutations for the types whose node order differs.
 # HEX20: Exodus puts the vertical (1-5, 2-6, 3-7, 4-8) mid-edge nodes before

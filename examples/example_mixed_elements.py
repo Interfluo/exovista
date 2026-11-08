@@ -1,50 +1,41 @@
+"""Write a mesh that mixes hexahedra and tetrahedra.
 
-import pyvista as pv
+An Exodus element block holds a single element type, so a region with
+several cell types is split into one block per type. Given a name for the
+region, the blocks are named ``<name>_<type>`` (here ``solid_hex8`` and
+``solid_tetra4``).
+"""
+
 import numpy as np
-import exovista
-import logging
+import pyvista as pv
 
-logging.basicConfig(level=logging.INFO)
+import exovista
+
 
 def main():
-    """
-    Example of saving a mesh with mixed element types (Hex and Tet).
-    """
-    # Create a Hex mesh (ImageData)
-    hex_grid = pv.ImageData(dimensions=(3, 3, 3)).cast_to_unstructured_grid()
-    
-    # Create a Tet mesh
-    # We can tetrahedralize a copy of the hex grid
-    # But let's make it distinct geometry
-    # Shift it to the right
-    tet_grid = hex_grid.copy()
-    tet_grid.points[:, 0] += 5.0
-    tet_grid = tet_grid.triangulate()
-    
-    # Combine them into one mesh
-    # simple concatenation of points and cells
-    combined = hex_grid.merge(tet_grid)
-    
-    # Assign regions
-    # Let's say hexes are region 1, tets are region 2
-    # But wait, write_exo splits by cell type AND region.
-    # So even if they have the same region, they will be different blocks because different cell types.
-    # Let's verify this behavior.
-    combined.cell_data["region"] = np.ones(combined.n_cells, dtype=int)
-    
-    # Save to EXO
-    output_filename = "example_mixed_elements.exo"
-    logging.info(f"Saving Mixed Element mesh to {output_filename}...")
-    # Expect 2 blocks: one for Hex, one for Tet (since region is 1 for all)
-    # block_names=["hex_block", "tet_block"] might work if the order is deterministic.
-    # write_pyvista.py iterates: `for cell_type in pv.CellType:`
-    # The order of pv.CellType iteration determines block order if regions are same.
-    # Usually: VERTEX, POLY_VERTEX, LINE, POLY_LINE, TRIANGLE, TRIANGLE_STRIP, POLYGON, PIXEL, QUAD, TETRA, VOXEL, HEXAHEDRON...
-    # So TETRA (10) comes before HEXAHEDRON (12)?
-    # Let's check pv.CellType values if we care about names.
-    # If we don't pass names, it defaults to block_0, block_1.
-    exovista.write_exo(output_filename, combined, block_names=["tet_block", "hex_block"])
-    logging.info("Done.")
+    # Hexahedra (VTK voxels) on the left, the same grid split into
+    # tetrahedra on the right.
+    hexes = pv.ImageData(dimensions=(3, 3, 3)).cast_to_unstructured_grid()
+    tets = hexes.translate((5.0, 0.0, 0.0)).triangulate()
+    combined = hexes.merge(tets)
+    print("cell types:", np.unique(combined.celltypes))
+
+    # One region for everything...
+    filename = "example_mixed_elements.exo"
+    exovista.write_exo(filename, combined, block_names="solid")
+    mesh = exovista.read_exo(filename)
+    names, counts = np.unique(mesh.cell_data["exo_block_name"], return_counts=True)
+    print("one region   :", dict(zip(names.tolist(), counts.tolist())))
+
+    # ... or one region per part, with block ids 10 and 20.
+    combined.cell_data["region"] = np.where(
+        combined.celltypes == pv.CellType.TETRA, 20, 10)
+    exovista.write_exo(filename, combined,
+                       block_names={10: "hex_part", 20: "tet_part"})
+    mesh = exovista.read_exo(filename)
+    ids, counts = np.unique(mesh.cell_data["exo_block_id"], return_counts=True)
+    print("two regions  :", dict(zip(ids.tolist(), counts.tolist())))
+
 
 if __name__ == "__main__":
     main()

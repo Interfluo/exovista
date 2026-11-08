@@ -30,12 +30,12 @@ logging.basicConfig(
 def export_tetra_mesh() -> None:
     """
     Export a tetrahedral mesh with element blocks and side sets.
-    
+
     Uses the PyVista 'letter_a' example mesh. Assigns regions based on
     x-coordinate for element blocks and z-coordinate for side sets.
     """
     logging.info("Exporting tetrahedral mesh...")
-    
+
     volume = pv.examples.download_letter_a()
     volume.points -= volume.center
     volume["tag"] = 1 * (volume.cell_centers().points[:, 0] > 0)
@@ -43,19 +43,19 @@ def export_tetra_mesh() -> None:
     surface = volume.extract_surface()
     surface["tag"] = 1 * (surface.cell_centers().points[:, 2] > 0)
 
-    exovista.write_exo("tetra.exo", volume, surface, "tag")
+    exovista.write_exo("tetra.exo", volume, surface, region_key="tag")
     logging.info("Saved tetra.exo")
 
 
 def export_hex_mesh() -> None:
     """
     Export a hexahedral mesh from a structured cylinder grid.
-    
+
     Creates a structured cylindrical mesh, assigns regions for element
     blocks and side sets, and exports with and without side sets.
     """
     logging.info("Exporting hexahedral mesh...")
-    
+
     volume = pv.CylinderStructured(
         radius=np.linspace(1, 2, 5)
     ).cast_to_unstructured_grid()
@@ -76,19 +76,19 @@ def export_hex_mesh() -> None:
 def export_hybrid() -> None:
     """
     Export a hybrid mesh combining tetrahedral and hexahedral elements.
-    
-    Combines the letter_a tetrahedral mesh with a structured cylinder
-    mesh to demonstrate mixed element type support.
+
+    Passes a MultiBlock of the letter_a tetrahedral mesh and a structured
+    cylinder mesh: each leaf becomes its own element block, named after it.
     """
     logging.info("Exporting hybrid mesh...")
-    
-    volume = pv.MultiBlock([
-        pv.examples.download_letter_a(),
-        pv.CylinderStructured(
+
+    volume = pv.MultiBlock({
+        "letter_a": pv.examples.download_letter_a(),
+        "cylinder": pv.CylinderStructured(
             radius=np.linspace(1, 2, 5)
-        ).cast_to_unstructured_grid()
-    ]).combine()
-    surface = volume.extract_surface()
+        ).cast_to_unstructured_grid(),
+    })
+    surface = volume.combine().extract_surface()
 
     exovista.write_exo("hybrid.exo", volume, surface)
     logging.info("Saved hybrid.exo")
@@ -97,12 +97,12 @@ def export_hybrid() -> None:
 def export_with_node_arrays() -> None:
     """
     Export a mesh with node arrays (point data).
-    
+
     Creates a simple mesh and adds a sinusoidal function as point data,
     demonstrating how to save node arrays to the Exodus file.
     """
     logging.info("Exporting mesh with node arrays...")
-    
+
     # Use a simple structured grid instead of tetgen for portability
     volume = pv.CylinderStructured(
         radius=np.linspace(1, 2, 10),
@@ -161,8 +161,8 @@ def main() -> None:
     args = parser.parse_args()
 
     # Default to node-arrays if no args provided (backward compatible)
-    if not any([args.tetra, args.hex, args.hybrid, getattr(args, 'node_arrays', False), args.all]):
-        setattr(args, 'node_arrays', True)
+    if not any([args.tetra, args.hex, args.hybrid, args.node_arrays, args.all]):
+        args.node_arrays = True
 
     if args.all or args.tetra:
         export_tetra_mesh()

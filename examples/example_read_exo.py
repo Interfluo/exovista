@@ -1,57 +1,52 @@
+"""Round trip: write a PyVista mesh to ExodusII, then read it back.
 
-import pyvista as pv
+``read_exo`` returns an UnstructuredGrid with float64 points, the cells in
+the order they were written, the variables at one time step, the block id
+and name of every cell, and (on request) the side sets as PolyData.
+"""
+
 import numpy as np
-import exovista
-import logging
+import pyvista as pv
 
-logging.basicConfig(level=logging.INFO)
+import exovista
 
 
 def main():
-    """
-    Round-trip example: write a PyVista mesh to ExodusII, then read it back.
-
-    Demonstrates exovista.read_exo, the inverse of exovista.write_exo. The
-    reconstructed UnstructuredGrid carries the originating Exodus block ids,
-    any node/element variables sampled at the requested time step, and the time
-    history in field_data.
-    """
     # A small hex grid split into two regions along x.
     grid = pv.ImageData(dimensions=(4, 3, 3)).cast_to_unstructured_grid()
     centers = grid.cell_centers().points
-    grid.cell_data["region"] = (centers[:, 0] > 1.5).astype(int)
+    grid.cell_data["region"] = np.where(centers[:, 0] > 1.5, 2, 1)
     grid.point_data["height"] = grid.points[:, 2]
+    grid.point_data["velocity"] = np.column_stack(
+        [grid.points[:, 1], -grid.points[:, 0], np.zeros(grid.n_points)])
 
-    # A boundary surface split into two side sets (top vs bottom).
+    # The boundary faces, split into two side sets (top vs. the rest).
     surface = grid.extract_surface()
-    surface.cell_data["region"] = (
-        surface.cell_centers().points[:, 2] > 1.0
-    ).astype(int)
+    top = surface.cell_centers().points[:, 2] > 1.5
+    surface.cell_data["region"] = np.where(top, 1, 2)
 
     # A short transient element field.
     times = np.linspace(0.0, 1.0, 3)
     energy = np.outer(times, np.arange(grid.n_cells, dtype=float))
 
     filename = "example_read_exo.exo"
-    logging.info(f"Writing {filename}...")
-    exovista.write_exo(
-        filename, grid, surface, region_key="region",
-        times=times, element_fields={"energy": energy},
-    )
+    exovista.write_exo(filename, grid, surface, times=times,
+                       side_set_names={1: "top", 2: "other"},
+                       element_fields={"energy": energy})
 
-    logging.info(f"Reading {filename} back into PyVista...")
-    # Ask for the side sets too (defaults to the last time step).
+    # The last time step by default; time_step is 1-based (-1 = last).
     mesh, side_sets = exovista.read_exo(filename, read_side_sets=True)
-
-    logging.info(f"  points: {mesh.n_points}, cells: {mesh.n_cells}")
-    logging.info(f"  element blocks: {np.unique(mesh.cell_data['exo_block_id'])}")
-    logging.info(f"  point arrays: {list(mesh.point_data.keys())}")
-    logging.info(f"  cell arrays:  {list(mesh.cell_data.keys())}")
-    logging.info(f"  times: {mesh.field_data['times']}")
-    logging.info(f"  side sets: {side_sets.keys()}")
+    print("points, cells:", mesh.n_points, mesh.n_cells, mesh.points.dtype)
+    print("blocks       :", np.unique(mesh.cell_data["exo_block_id"]))
+    print("point arrays :", list(mesh.point_data.keys()))  # velocity is (n, 3)
+    print("cell arrays  :", list(mesh.cell_data.keys()))
+    print("times        :", mesh.field_data["times"])
+    print("energy == input at t=1:", np.array_equal(mesh.cell_data["energy"],
+                                                    energy[-1]))
     for name in side_sets.keys():
-        logging.info(f"    {name}: {side_sets[name].n_cells} faces")
-    logging.info("Done.")
+        faces = side_sets[name]
+        print(f"side set {name!r}: {faces.n_cells} faces, cells "
+              f"{np.unique(faces.cell_data['cell_id'])}")
 
 
 if __name__ == "__main__":

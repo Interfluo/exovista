@@ -1,51 +1,51 @@
+"""Write a 2D quad mesh with two materials, then read it back.
 
-import pyvista as pv
+A mesh whose cells are all 2D and whose points share one z coordinate is
+written as a planar (``num_dim=2``) Exodus file: QUAD4 elements with x/y
+coordinates only.
+"""
+
 import numpy as np
-import exovista
-import logging
+import pyvista as pv
 
-logging.basicConfig(level=logging.INFO)
+import exovista
+
 
 def main():
-    """
-    Example of creating and saving a 2D mesh with generic Quad elements.
-    """
-    # Create points for a simple square made of 4 quads
-    # 0 -- 1 -- 2
+    # A 2 x 2 square of quads:
+    # 6 -- 7 -- 8
     # |    |    |
     # 3 -- 4 -- 5
     # |    |    |
-    # 6 -- 7 -- 8
+    # 0 -- 1 -- 2
     points = np.array([
         [0, 0, 0], [1, 0, 0], [2, 0, 0],
         [0, 1, 0], [1, 1, 0], [2, 1, 0],
-        [0, 2, 0], [1, 2, 0], [2, 2, 0]
+        [0, 2, 0], [1, 2, 0], [2, 2, 0],
     ], dtype=float)
-
-    # 4 Quad cells
-    # Cell 0: 0, 1, 4, 3
-    # Cell 1: 1, 2, 5, 4
-    # Cell 2: 3, 4, 7, 6
-    # Cell 3: 4, 5, 8, 7
-    cells = np.concatenate([
-        [4, 0, 1, 4, 3],
-        [4, 1, 2, 5, 4],
-        [4, 3, 4, 7, 6],
-        [4, 4, 5, 8, 7]
+    quads = np.array([
+        [0, 1, 4, 3],
+        [1, 2, 5, 4],
+        [3, 4, 7, 6],
+        [4, 5, 8, 7],
     ])
-    cell_types = np.array([pv.CellType.QUAD] * 4)
+    grid = pv.UnstructuredGrid({pv.CellType.QUAD: quads}, points)
 
-    grid = pv.UnstructuredGrid(cells, cell_types, points)
-    
-    # Assign region data - let's make two materials
-    # Cells 0 and 3 are material 1, Cells 1 and 2 are material 2
+    # Two materials in a checkerboard: the region values become block ids.
     grid.cell_data["region"] = np.array([1, 2, 2, 1])
+    grid.point_data["height"] = grid.points[:, 0] + grid.points[:, 1]
 
-    # Save to EXO
-    output_filename = "example_2d_quads.exo"
-    logging.info(f"Saving 2D Quad mesh to {output_filename}...")
-    exovista.write_exo(output_filename, grid)
-    logging.info("Done.")
+    filename = "example_2d_quads.exo"
+    exovista.write_exo(filename, grid, block_names={1: "copper", 2: "steel"})
+    print(f"wrote {filename}")
+
+    mesh = exovista.read_exo(filename)
+    print("num_dim       :", int(mesh.field_data["num_dim"][0]))
+    print("block ids     :", mesh.cell_data["exo_block_id"])
+    print("block names   :", list(mesh.cell_data["exo_block_name"]))
+    same = np.array_equal(mesh.cell_connectivity, grid.cell_connectivity)
+    print("cells in input order:", same)
+
 
 if __name__ == "__main__":
     main()
