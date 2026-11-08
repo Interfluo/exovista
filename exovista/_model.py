@@ -30,6 +30,7 @@ __all__ = [
     "ExodusModel",
     "MAX_NAME_LENGTH",
     "component_suffixes",
+    "component_groups",
 ]
 
 #: Longest entity / variable name an Exodus file can store (``len_name``), in
@@ -62,6 +63,68 @@ def component_suffixes(n_components: int) -> tuple[str, ...]:
     if n < 1:
         raise ValueError(f"n_components must be >= 1, got {n_components!r}")
     return _COMPONENT_SUFFIXES.get(n, tuple(f"_{i}" for i in range(n)))
+
+
+# The letter-suffix conventions, largest first (6 is a subset of 9).
+_LETTER_CONVENTIONS = tuple(
+    tuple(s[1:] for s in _COMPONENT_SUFFIXES[n]) for n in (9, 6, 3, 2)
+)
+_LETTERS = frozenset(s for convention in _LETTER_CONVENTIONS for s in convention)
+
+
+def component_groups(names) -> dict[str, list[str]]:
+    """Group scalar variable names that are components of one array.
+
+    The inverse of splitting with :func:`component_suffixes`: returns
+    ``{base name: [component names in convention order]}`` for every base
+    whose components are present. For each base (the text before the last
+    ``"_"``) the letter and the digit suffixes are considered separately:
+
+    * letters: the largest complete convention present -- the 9 full-tensor
+      suffixes, else the 6 symmetric-tensor ones, else ``X, Y, Z``, else
+      ``X, Y``;
+    * digits: ``0 .. n-1`` with ``n`` the length of the run of consecutive
+      digit suffixes from 0, if ``n`` is a digit convention (``n >= 4`` and
+      not 6 or 9).
+
+    Names that are not part of the chosen group (e.g. ``"V_0"`` next to
+    ``V_X, V_Y, V_Z``) stay scalars. If both kinds form a group, the larger
+    one wins (letters on a tie). A base that is itself one of ``names`` is
+    never grouped.
+    """
+    names = list(names)
+    letters: dict[str, dict[str, str]] = {}
+    digits: dict[str, dict[int, str]] = {}
+    for name in names:
+        base, sep, suffix = name.rpartition("_")
+        if not base or not sep:
+            continue
+        if suffix in _LETTERS:
+            letters.setdefault(base, {})[suffix] = name
+        elif suffix.isascii() and suffix.isdigit() and str(int(suffix)) == suffix:
+            digits.setdefault(base, {})[int(suffix)] = name
+    existing = set(names)
+    groups: dict[str, list[str]] = {}
+    for base in dict.fromkeys([*letters, *digits]):
+        if base in existing:
+            continue
+        best: list[str] | None = None
+        by_letter = letters.get(base, {})
+        for convention in _LETTER_CONVENTIONS:
+            if all(s in by_letter for s in convention):
+                best = [by_letter[s] for s in convention]
+                break
+        by_digit = digits.get(base, {})
+        n = 0
+        while n in by_digit:
+            n += 1
+        if n >= 4 and n not in _COMPONENT_SUFFIXES and (
+            best is None or n > len(best)
+        ):
+            best = [by_digit[k] for k in range(n)]
+        if best is not None:
+            groups[base] = best
+    return groups
 
 
 def _int_array(values, ndim: int, what: str) -> np.ndarray:
@@ -387,6 +450,12 @@ class ExodusModel:
         for block in self.blocks:
             if not block.elem_type:
                 raise ValueError(f"Block {block.id} has no element type")
+            if block.n_elem and not block.n_nodes_per_elem:
+                raise ValueError(
+                    f"Block {block.id} ({block.elem_type}) has elements but no "
+                    "nodal connectivity; polygon / polyhedron (NSIDED / NFACED) "
+                    "blocks cannot be written"
+                )
             conn = block.conn
             if conn.size and (conn.min() < 0 or conn.max() >= n_nodes):
                 raise ValueError(

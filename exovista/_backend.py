@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import glob
 import os
+import stat
 import uuid
+import warnings
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -31,6 +33,8 @@ from .parallel_file import parallel_exodusii_file
 __all__ = ["write_model", "open_reader", "read_model", "ExodusReader"]
 
 _COORD_NAMES = ("x", "y", "z")
+
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
 
 
 # --------------------------------------------------------------------------- #
@@ -70,6 +74,14 @@ def write_model(
     info records when given, the time values, and node, element and global
     variables. Element variables get a truth table: a variable is stored only
     on the blocks for which the model provides values.
+
+    The ``time_step`` dimension gets the fixed length ``model.n_steps`` (it
+    is unlimited only when there are no steps): reading a netCDF-4 file with
+    an unlimited dimension costs a scan of every variable per variable read.
+    The file can therefore not be extended with more time steps in place.
+
+    If ``filename`` is a symbolic link, the file it points to is replaced
+    (the link is kept); an existing file keeps its permission bits.
     """
     if not isinstance(model, ExodusModel):
         raise TypeError(f"expected an ExodusModel, got {type(model).__name__}")
@@ -80,29 +92,82 @@ def write_model(
             f"compression_level must be in 0..9, got {compression_level!r}"
         )
     model.validate()
+    if int(float_word_size) == 4:
+        _check_single_precision(model)
 
-    filename = os.fspath(filename)
-    directory = os.path.dirname(os.path.abspath(filename))
+    # Replace the file a symbolic link points to, not the link itself.
+    target = os.path.realpath(os.fspath(filename))
+    directory = os.path.dirname(target)
     if not os.path.isdir(directory):
         raise FileNotFoundError(f"directory does not exist: {directory}")
-    tmp = os.path.join(
-        directory, f".{os.path.basename(filename)}.{uuid.uuid4().hex[:12]}.tmp"
-    )
+    # A short temporary name: "<target name>.<hex>.tmp" would exceed NAME_MAX
+    # for long (but valid) target names.
+    tmp = os.path.join(directory, f".exovista-{uuid.uuid4().hex[:16]}.tmp")
     try:
         with exodusii_file(
             tmp,
             mode="w",
             float_word_size=float_word_size,
             compression_level=compression_level,
-        ) as f:
+            num_time_steps=model.n_steps,
+        ) as f, np.errstate(over="ignore"):
+            # (float32 overflow to inf was reported above)
             _write(f, model)
-        os.replace(tmp, filename)
+        try:
+            # keep the permissions of the file being replaced
+            os.chmod(tmp, stat.S_IMODE(os.stat(target).st_mode))
+        except FileNotFoundError:
+            pass
+        os.replace(tmp, target)
     except BaseException:
         try:
             os.remove(tmp)
         except OSError:
             pass
         raise
+
+
+def _finite_max_abs(values: np.ndarray) -> float:
+    """Largest finite magnitude in ``values`` (0.0 if none)."""
+    values = np.asarray(values)
+    while values.ndim and values.shape[0] > 1 and values.strides[0] == 0:
+        values = values[:1]  # a static array broadcast over the steps
+    if values.size == 0:
+        return 0.0
+    magnitude = np.abs(values)
+    magnitude = magnitude[np.isfinite(magnitude)]
+    return float(magnitude.max()) if magnitude.size else 0.0
+
+
+def _check_single_precision(model: ExodusModel) -> None:
+    """Refuse coordinates / times and warn for variables that overflow float32."""
+    for what, values in (("coordinates", model.coords), ("times", model.times)):
+        biggest = _finite_max_abs(values)
+        if biggest > _FLOAT32_MAX:
+            raise ValueError(
+                f"{what} reach {biggest:g}, beyond the single-precision range "
+                f"(+-{_FLOAT32_MAX:.4g}); write with double precision"
+            )
+    overflow = []
+    for kind, variables in (
+        ("node", model.node_vars),
+        ("global", model.global_vars),
+    ):
+        overflow += [
+            f"{kind} {name!r}" for name, values in variables.items()
+            if _finite_max_abs(values) > _FLOAT32_MAX
+        ]
+    for name, per_block in model.elem_vars.items():
+        if any(_finite_max_abs(v) > _FLOAT32_MAX for v in per_block.values()):
+            overflow.append(f"element {name!r}")
+    if overflow:
+        warnings.warn(
+            "values beyond the single-precision range are stored as +-inf in "
+            f"variable(s) {', '.join(overflow)}; write with double precision "
+            "to keep them",
+            UserWarning,
+            stacklevel=4,
+        )
 
 
 def _write(f: exodusii_file, model: ExodusModel) -> None:
@@ -213,6 +278,39 @@ def _str_list(names) -> list[str]:
     return [str(n).rstrip() for n in np.atleast_1d(names)]
 
 
+def _unique_names(names: list[str], kind: str) -> list[str]:
+    """Usable, unique variable names (warns when one had to be changed).
+
+    An empty name becomes ``f"{kind}_var_{index}"`` (1-based index) and a
+    repeated name gets ``"_"`` appended until it is unique (as VTK's reader
+    does), so every stored variable stays reachable by name.
+    """
+    first: dict[str, int] = {}
+    for i, name in enumerate(names):
+        if name and name not in first:
+            first[name] = i
+    used = set(first)
+    out, changed = [], []
+    for i, name in enumerate(names):
+        if name and first[name] == i:
+            out.append(name)
+            continue
+        candidate = name + "_" if name else f"{kind}_var_{i + 1}"
+        while candidate in used:
+            candidate += "_"
+        used.add(candidate)
+        out.append(candidate)
+        changed.append(f"{i + 1}: {name!r} -> {candidate!r}")
+    if changed:
+        warnings.warn(
+            f"Renamed {kind} variable(s) with an empty or repeated name: "
+            + ", ".join(changed),
+            UserWarning,
+            stacklevel=4,
+        )
+    return out
+
+
 class ExodusReader:
     """Read-only view of an open Exodus database (serial or parallel).
 
@@ -223,19 +321,28 @@ class ExodusReader:
     read by slicing the netCDF variable, never by loading the whole history.
 
     Names keep leading whitespace and lose trailing whitespace, as with the
-    Exodus library. Every variable is a scalar series: a nodal variable
-    stored with extra component axes (meshio writes vector point data as
+    Exodus library. Variables are read by their index in the file, and
+    variable names are made unique: an empty name becomes
+    ``"<kind>_var_<index>"`` and a repeated one gets ``"_"`` appended (with a
+    warning). Every variable is a scalar series: a nodal variable stored with
+    extra component axes (meshio writes vector point data as
     ``vals_nod_varN`` with shape ``(time_step, num_nodes, n)``) is exposed as
     ``n`` scalar variables named with
     :func:`~exovista._model.component_suffixes` (``vec_X``, ``vec_Y``, ...).
+
+    Element blocks the reader cannot represent (``NSIDED`` / ``NFACED``
+    polygons and polyhedra, or blocks without a 2D connectivity array) are
+    returned with their element count and an ``(n_elem, 0)`` connectivity,
+    so element numbering stays aligned with the file.
     """
 
     def __init__(self, handle: exodusii_file):
         self._f = handle
         self._parallel = isinstance(handle, parallel_exodusii_file)
         self._times: np.ndarray | None = None
-        self._cache: dict[str, list] = {}
-        self._node_vars: dict[str, tuple[str, int | None, int]] | None = None
+        self._cache: dict[str, object] = {}
+        # public name -> (1-based stored index, component or None, n_comp)
+        self._node_vars: dict[str, tuple[int, int | None, int]] | None = None
 
     # -- metadata --------------------------------------------------------- #
     @property
@@ -261,7 +368,7 @@ class ExodusReader:
     @property
     def num_steps(self) -> int:
         """Number of time steps."""
-        return int(self.times().shape[0])
+        return int(self._times_cached().shape[0])
 
     @property
     def float_word_size(self) -> int:
@@ -280,11 +387,12 @@ class ExodusReader:
         coords = np.asarray(self._f.get_coords(), dtype=np.float64)
         return coords.reshape(-1, self.num_dim)
 
-    def _cached(self, key: str, compute) -> list:
+    def _cached(self, key: str, compute):
         # The file is read-only, so metadata such as names never changes.
         if key not in self._cache:
             self._cache[key] = compute()
-        return list(self._cache[key])
+        value = self._cache[key]
+        return list(value) if isinstance(value, list) else value
 
     def _block_ids(self) -> list[int]:
         def compute():
@@ -293,40 +401,82 @@ class ExodusReader:
 
         return self._cached("block_ids", compute)
 
+    def _block_iid(self, block_id: int) -> int:
+        """1-based index of an element block id (KeyError if unknown)."""
+        index = self._cached(
+            "block_iid", lambda: {b: i for i, b in enumerate(self._block_ids(), 1)}
+        )
+        try:
+            return index[int(block_id)]
+        except KeyError:
+            raise KeyError(f"{block_id} is not an element block id") from None
+
     def blocks(self) -> list[Block]:
         """Element blocks in file order (names may be "").
 
         NULL blocks (no elements) are returned with an empty ``(0, 0)``
         connectivity and ``elem_type`` "NULL" when the file stores none.
+        Blocks whose connectivity is not a 2D ``(n_elem, n_nodes)`` array
+        (``NSIDED``, ``NFACED``) keep their element count with an
+        ``(n_elem, 0)`` connectivity.
         """
+        return self._cached("blocks", self._read_blocks)
+
+    def _read_blocks(self) -> list[Block]:
         f = self._f
         out = []
-        for block_id in self._block_ids():
+        for iid, block_id in enumerate(self._block_ids(), start=1):
             name = str(f.get_element_block_name(block_id) or "").rstrip()
-            info = f.get_element_block(block_id)
-            if info is None or not info.num_block_elems:
-                elem_type = "NULL" if info is None else str(info.elem_type)
-                out.append(Block(block_id, name, elem_type, np.zeros((0, 0), int)))
+            elem_type, n_elem, conn = self._block_data(block_id, iid)
+            if conn is None:
+                conn = np.zeros((n_elem, 0), dtype=np.int64)
+                out.append(Block(block_id, name, elem_type, conn))
                 continue
-            n_elem = int(info.num_block_elems)
-            n_nodes = int(info.num_elem_nodes)
-            conn = np.asarray(f.get_element_conn(block_id), dtype=np.int64)
-            conn = conn.reshape(n_elem, n_nodes) - 1
             out.append(
                 Block(
                     block_id,
                     name,
-                    str(info.elem_type),
+                    elem_type,
                     conn,
                     attributes=self._block_attributes(block_id, n_elem),
                 )
             )
         return out
 
+    def _block_data(self, block_id: int, iid: int):
+        """``(elem_type, n_elem, conn (0-based) or None)`` of one block."""
+        f = self._f
+        if self._parallel:
+            info = f.get_element_block(block_id)
+            if info is None or not info.num_block_elems:
+                return "NULL" if info is None else str(info.elem_type), 0, None
+            n_elem = int(info.num_block_elems)
+            elem_type = info.elem_type
+            conn = f.get_element_conn(block_id) if elem_type is not None else None
+        else:
+            n_elem = int(f.get_dimension(ex.DIM_NUM_ELEM_IN_ELEM_BLK(iid), 0) or 0)
+            var = f.get_variable(ex.VAR_ELEM_BLK_CONN(iid), raw=True)
+            if var is None:
+                # NFACED blocks store face connectivity instead
+                var = f.get_variable(ex.VAR_FACE_CONN(iid), raw=True)
+            elem_type = getattr(var, "elem_type", None) if var is not None else None
+            if not n_elem:
+                return "NULL" if elem_type is None else str(elem_type), 0, None
+            conn = None
+            if var is not None and len(var.shape) == 2 and var.shape[0] == n_elem:
+                conn = var[:]
+        elem_type = "UNKNOWN" if elem_type is None else str(elem_type)
+        if conn is None:
+            return elem_type, n_elem, None
+        conn = np.asarray(np.ma.getdata(conn), dtype=np.int64)
+        if conn.ndim != 2 or conn.shape[0] != n_elem:
+            return elem_type, n_elem, None
+        return elem_type, n_elem, conn - 1
+
     def _block_attributes(self, block_id: int, n_elem: int) -> np.ndarray | None:
         if self._parallel:
             return None  # not supported by the parallel core
-        iid = self._f.get_element_block_iid(block_id)
+        iid = self._block_iid(block_id)
         attr = self._f.get_variable(ex.VAR_ELEM_ATTRIB(iid))
         if attr is None:
             return None
@@ -339,12 +489,17 @@ class ExodusReader:
         parallel decomposition these are the global element ids in the joined
         order (blocks in order, ids increasing within each block).
         """
-        if self._parallel:
-            return np.asarray(self._f.get_element_id_map(), dtype=np.int64)
-        values = self._f.get_variable(ex.VAR_ELEM_NUM_MAP)
-        if values is None:
-            return None
-        return np.asarray(values, dtype=np.int64).reshape(-1)
+
+        def compute():
+            if self._parallel:
+                return np.asarray(self._f.get_element_id_map(), dtype=np.int64)
+            values = self._f.get_variable(ex.VAR_ELEM_NUM_MAP)
+            if values is None:
+                return None
+            return np.asarray(values, dtype=np.int64).reshape(-1)
+
+        ids = self._cached("elem_id_map", compute)
+        return None if ids is None else ids.copy()
 
     def side_sets(self) -> list[SideSet]:
         """Side sets in file order (elements 0-based in file order)."""
@@ -367,12 +522,6 @@ class ExodusReader:
         """Node sets in file order (0-based node indices)."""
         f = self._f
         ids = f.get_node_set_ids()
-        contiguous = None
-        if self._parallel:
-            # The parallel core returns global node ids; coordinates use the
-            # contiguous numbering of those ids.
-            l2g = f.get_mapping(ex.maps.node_local_to_global)
-            contiguous = f.make_contiguous(l2g)
         out = []
         for set_id in [] if ids is None else np.atleast_1d(ids):
             set_id = int(set_id)
@@ -381,30 +530,38 @@ class ExodusReader:
             if nodes is None:
                 nodes = np.zeros(0, dtype=np.int64)
             nodes = np.asarray(nodes, dtype=np.int64).reshape(-1)
-            if contiguous is not None:
-                nodes = np.array([contiguous[int(n)] for n in nodes], dtype=np.int64)
-            out.append(NodeSet(set_id, name, nodes - 1))
+            if self._parallel:
+                # The parallel core returns global node ids; coordinates use
+                # the contiguous numbering of those ids.
+                out.append(NodeSet(set_id, name, f.global_node_index(nodes)))
+            else:
+                out.append(NodeSet(set_id, name, nodes - 1))
         return out
 
     # -- results -------------------------------------------------------------- #
-    def times(self) -> np.ndarray:
-        """Time values, float64 ``(num_steps,)`` (empty if none)."""
+    def _times_cached(self) -> np.ndarray:
         if self._times is None:
             times = self._f.get_times()
             times = np.zeros(0) if times is None else times
             self._times = np.asarray(times, dtype=np.float64).reshape(-1)
-        return self._times.copy()
+        return self._times
 
-    def _node_variables(self) -> dict[str, tuple[str, int | None, int]]:
-        """Nodal variable name -> (stored name, component or None, n_comp)."""
+    def times(self) -> np.ndarray:
+        """Time values, float64 ``(num_steps,)`` (empty if none)."""
+        return self._times_cached().copy()
+
+    def _node_variables(self) -> dict[str, tuple[int, int | None, int]]:
+        """Nodal variable name -> (1-based stored index, component, n_comp)."""
         if self._node_vars is None:
-            stored = _str_list(self._f.get_node_variable_names())
+            stored = _unique_names(
+                _str_list(self._f.get_node_variable_names()), "node"
+            )
             n_comps = [self._node_var_components(i) for i in range(1, len(stored) + 1)]
             taken = {name for name, n in zip(stored, n_comps) if n is None}
-            mapping: dict[str, tuple[str, int | None, int]] = {}
-            for name, n in zip(stored, n_comps):
+            mapping: dict[str, tuple[int, int | None, int]] = {}
+            for iid, (name, n) in enumerate(zip(stored, n_comps), start=1):
                 if n is None:
-                    mapping.setdefault(name, (name, None, 1))
+                    mapping[name] = (iid, None, 1)
                     continue
                 if n == 0:
                     continue  # an empty component axis holds no values
@@ -421,7 +578,7 @@ class ExodusReader:
                     )
                 taken.update(names)
                 for k, component in enumerate(names):
-                    mapping[component] = (name, k, n)
+                    mapping[component] = (iid, k, n)
             self._node_vars = mapping
         return self._node_vars
 
@@ -437,36 +594,66 @@ class ExodusReader:
             return None
         return int(np.prod(var.shape[2:]))
 
+    def _elem_variables(self) -> dict[str, int]:
+        """Element variable name -> 1-based stored index."""
+        return self._cached(
+            "elem_vars",
+            lambda: {
+                name: iid
+                for iid, name in enumerate(
+                    _unique_names(
+                        _str_list(self._f.get_element_variable_names()), "elem"
+                    ),
+                    start=1,
+                )
+            },
+        )
+
+    def _global_variables(self) -> dict[str, int]:
+        """Global variable name -> 1-based stored index."""
+        return self._cached(
+            "global_vars",
+            lambda: {
+                name: iid
+                for iid, name in enumerate(
+                    _unique_names(
+                        _str_list(self._f.get_global_variable_names()), "global"
+                    ),
+                    start=1,
+                )
+            },
+        )
+
     def node_var_names(self) -> list[str]:
         """Names of the nodal variables (one per component, see class doc)."""
         return list(self._node_variables())
 
     def elem_var_names(self) -> list[str]:
         """Names of the element variables."""
-        return self._cached(
-            "elem", lambda: _str_list(self._f.get_element_variable_names())
-        )
+        return list(self._elem_variables())
 
     def global_var_names(self) -> list[str]:
         """Names of the global variables."""
-        return self._cached(
-            "global", lambda: _str_list(self._f.get_global_variable_names())
-        )
+        return list(self._global_variables())
 
-    def _time_step(self, step: int | None) -> int | None:
-        """0-based ``step`` -> 1-based core ``time_step`` (None stays None)."""
+    def _step_index(self, step: int | None):
+        """0-based ``step`` -> netCDF index of the time axis (all steps: None)."""
         if step is None:
-            return None
+            return slice(None)
         step = int(step)
         n = self.num_steps
         if not 0 <= step < n:
             raise IndexError(f"step {step} is out of range for {n} time step(s)")
-        return step + 1
+        return step
 
     @staticmethod
-    def _check_name(name: str, names: list[str], kind: str) -> None:
-        if name not in names:
-            raise KeyError(f"{name!r} is not a {kind} variable; available: {names}")
+    def _lookup(name: str, variables: dict, kind: str):
+        try:
+            return variables[name]
+        except KeyError:
+            raise KeyError(
+                f"{name!r} is not a {kind} variable; available: {list(variables)}"
+            ) from None
 
     def node_var(self, name: str, step: int | None = None) -> np.ndarray:
         """Values of nodal variable ``name``.
@@ -474,10 +661,16 @@ class ExodusReader:
         Returns ``(num_steps, num_nodes)`` for ``step=None``, else the
         ``(num_nodes,)`` values at 0-based ``step``. Always float64.
         """
-        self._check_name(name, self.node_var_names(), "node")
-        stored, component, n_comp = self._node_variables()[name]
-        time_step = self._time_step(step)
-        values = self._f.get_node_variable_values(stored, time_step=time_step)
+        iid, component, n_comp = self._lookup(name, self._node_variables(), "node")
+        index = self._step_index(step)
+        if self._parallel:
+            values = self._f.node_variable_values_by_index(iid, index)
+        else:
+            values = self._f.get_variable(ex.VAR_NODE_VAR(iid), index=index)
+        if values is None:
+            shape = (self.num_nodes,) if step is not None else (
+                self.num_steps, self.num_nodes)
+            return np.full(shape, np.nan)
         values = np.asarray(values, dtype=np.float64)
         if component is not None:
             lead = 1 if step is not None else 2
@@ -494,13 +687,15 @@ class ExodusReader:
         ``(n_block_elems,)`` values at 0-based ``step``; None when the variable
         is not defined on that block (truth table). Always float64.
         """
-        self._check_name(name, self.elem_var_names(), "element")
-        if int(block_id) not in self._block_ids():
-            raise KeyError(f"{block_id} is not an element block id")
-        time_step = self._time_step(step)
-        values = self._f.get_element_variable_values(
-            int(block_id), name, time_step=time_step
-        )
+        iid = self._lookup(name, self._elem_variables(), "element")
+        block_iid = self._block_iid(block_id)
+        index = self._step_index(step)
+        if self._parallel:
+            values = self._f.element_variable_values_by_index(
+                int(block_id), iid, index
+            )
+        else:
+            values = self._f.get_variable(ex.VAR_ELEM_VAR(iid, block_iid), index=index)
         if values is None:
             return None
         return np.asarray(values, dtype=np.float64)
@@ -511,12 +706,14 @@ class ExodusReader:
         Returns a float64 ``(num_steps,)`` array for ``step=None``, else the
         float value at 0-based ``step``.
         """
-        self._check_name(name, self.global_var_names(), "global")
-        time_step = self._time_step(step)
-        if time_step is None:
-            values = self._f.get_global_variable_values(name)
+        iid = self._lookup(name, self._global_variables(), "global")
+        index = self._step_index(step)
+        values = self._f.get_variable(ex.VAR_GLO_VAR, index=(index, iid - 1))
+        if values is None:
+            values = np.full(self.num_steps, np.nan)[index]
+        if step is None:
             return np.asarray(values, dtype=np.float64).reshape(-1)
-        return float(self._f.get_global_variable_value(name, time_step))
+        return float(np.asarray(values, dtype=np.float64).reshape(()))
 
     def qa_records(self) -> list[tuple[str, ...]]:
         """QA records as tuples of 4 strings (empty if none)."""

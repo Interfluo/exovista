@@ -308,8 +308,11 @@ def test_exo_type_for():
 
 
 def test_written_names():
-    # meshio (<= 5.3) only reads the short names of these three types
-    short = {"TETRA4": "TETRA", "WEDGE6": "WEDGE", "PYRAMID5": "PYRAMID"}
+    # meshio (<= 5.3) only reads the short names of these types (and knows no
+    # TRISHELL; a TRI in a 3D file is a triangular shell for every Exodus
+    # reader)
+    short = {"TETRA4": "TETRA", "WEDGE6": "WEDGE", "PYRAMID5": "PYRAMID",
+             "TRISHELL3": "TRI3", "TRISHELL6": "TRI6"}
     for name, info in ct.EXO_TYPES.items():
         assert info.written_name == short.get(name, name)
         # every reader resolves the written name (plus node count) to the type
@@ -317,7 +320,8 @@ def test_written_names():
         assert ct.resolve_exo_type(info.written_name, info.n_nodes, num_dim) is info
     for name, written in short.items():
         # without a node count the short name is still the linear element
-        assert ct.resolve_exo_type(written) is ct.EXO_TYPES[name]
+        num_dim = 3 if name.startswith("TRISHELL") else None
+        assert ct.resolve_exo_type(written, num_dim=num_dim) is ct.EXO_TYPES[name]
 
 
 @pytest.mark.parametrize(
@@ -386,6 +390,15 @@ def test_3d_cells_rejected_in_2d_files():
         ("HEXA", 20, None, "HEX20"),
         ("SHE", 8, None, "SHELL8"),
         ("PYRAMIDAL", 13, None, "PYRAMID13"),
+        # only the leading letters count: separators and suffixes are ignored
+        ("HEX_8", None, None, "HEX8"),
+        ("HEX8_ALT", 8, None, "HEX8"),
+        ("HEX-8", 8, None, "HEX8"),
+        ("HEX8S", 8, None, "HEX8"),
+        ("Hex 8", 8, None, "HEX8"),
+        ("HEX8_2", None, None, "HEX8"),
+        ("TETRA_10", None, None, "TETRA10"),
+        ("tri-6", None, 2, "TRI6"),
         # TRI <-> TRISHELL follows num_dim
         ("TRISHELL3", 3, 2, "TRI3"),
         ("TRISHELL", 6, 2, "TRI6"),
@@ -408,7 +421,10 @@ def test_resolve_aliases(name, n_nodes, num_dim, expected):
         ("TR", None),
         ("STR2", None),  # VTK only knows the full word STRAIGHT
         ("PENTA6", None),
-        ("HEX8_2", None),
+        ("_HEX8", None),
+        ("8HEX", None),
+        ("NSIDED", None),
+        ("NFACED", None),
     ],
 )
 def test_resolve_unknown(name, n_nodes):

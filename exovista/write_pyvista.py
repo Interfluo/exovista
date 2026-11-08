@@ -18,6 +18,7 @@ and writes it with :func:`exovista._backend.write_model`:
 from __future__ import annotations
 
 import logging
+import re
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 import numpy as np
 import pyvista as pv
 from scipy.spatial import cKDTree
+from vtkmodules.util.numpy_support import numpy_to_vtk
 from vtkmodules.vtkCommonDataModel import vtkDataObject
 
 from . import _celltypes as ct
@@ -35,6 +37,7 @@ from ._model import (
     ExodusModel,
     NodeSet,
     SideSet,
+    component_groups,
     component_suffixes,
 )
 
@@ -60,8 +63,31 @@ _EXCLUDED_ARRAYS = frozenset(
         "GlobalNodeId",
         "PedigreeElementId",
         "PedigreeNodeId",
+        "ImplicitElementId",
+        "ImplicitNodeId",
+        "SourceElementId",
+        "SourceElementSide",
     }
 )
+
+#: Top-level keys of the MultiBlock that VTK's Exodus reader (``pv.read``,
+#: ``pv.ExodusIIReader(...).read()``) returns.
+_EXODUS_READER_KEYS = frozenset(
+    {
+        "Element Blocks",
+        "Face Blocks",
+        "Edge Blocks",
+        "Element Sets",
+        "Side Sets",
+        "Face Sets",
+        "Edge Sets",
+        "Node Sets",
+    }
+)
+#: Internal region array of side sets converted from VTK reader output.
+_SET_KEY = "__exovista_set_id__"
+#: Largest integers stored exactly by float32 / float64.
+_EXACT_INT = {4: 2**24, 8: 2**53}
 
 _PRECISIONS = {"double": 8, "float64": 8, "single": 4, "float32": 4}
 
@@ -69,6 +95,9 @@ _PRECISIONS = {"double": 8, "float64": 8, "single": 4, "float32": 4}
 _FLAT_RTOL = 1e-12
 #: Default side-set matching tolerance, relative to the bounding-box diagonal.
 _SIDE_SET_RTOL = 1e-6
+#: Volume nodes closer than this (relative to the bounding-box diagonal) are
+#: duplicates of one node (an unmerged mesh) when matching side sets.
+_COINCIDENT_RTOL = 1e-12
 #: A face normal is "pointing out" of an element when (face centre - element
 #: centre) . normal exceeds this fraction of |face centre - element centre| |n|.
 _NORMAL_RTOL = 1e-9
@@ -105,21 +134,43 @@ def write_exo(
     filename : str or os.PathLike
         Output path. The file is written to a temporary file next to it and
         moved into place only when complete: on any error no file is created
-        (an existing file is left untouched).
+        (an existing file is left untouched). If ``filename`` is a symbolic
+        link, the file it points to is replaced; an existing file keeps its
+        permissions. The time dimension has a fixed length (fast to read),
+        so time steps cannot be appended to the file afterwards.
     volume : pyvista.DataSet or pyvista.MultiBlock
         The mesh. Any dataset is accepted (it is cast with
         ``cast_to_unstructured_grid()`` when needed). For a ``MultiBlock``,
         every non-empty leaf becomes its own region (region values ``1..N`` in
-        leaf order, block names default to the leaf keys); the leaves are
-        combined with ``merge_points=True`` and "original cell order" below
-        means the order of the combined mesh (leaf after leaf). The input is
-        never modified.
+        leaf order, block names default to the leaf keys; a leaf's own
+        ``region_key`` array is ignored); points with identical coordinates
+        are merged (as ``combine(merge_points=True)``; to keep coincident
+        nodes of touching bodies apart, give each leaf a region array and
+        pass ``multiblock.combine(merge_points=False)`` instead) and "original
+        cell order" below means the order of the combined mesh (leaf after
+        leaf). Point and cell arrays of only some leaves are kept: they are
+        NaN on the other leaves' points and cells (so the cell arrays are not
+        stored on those blocks, see Notes). The output of VTK's Exodus reader
+        (``pv.read("x.exo")``, ``pv.ExodusIIReader(...).read()`` or its
+        ``"Element Blocks"``) is recognised: its element blocks keep their
+        ids and names, its side sets and node sets are written (unless
+        ``surface`` / ``node_sets`` are given), its vectors glued by VTK
+        (``vel_`` from ``vel_X, vel_Y, vel_Z``; in 2D files padded with a
+        zero third component) are written under their original names, and
+        its other entities are ignored with a warning. Its nodes are merged
+        by ``GlobalNodeId`` when present (enable it with
+        ``reader.reader.GenerateGlobalNodeIdArrayOn()`` to keep coincident
+        nodes apart and the file's node order), else by coordinates. Note
+        that VTK's reader moves the points by displacement variables
+        (``DISPL*``) unless told otherwise. The input is never modified.
     surface : pyvista.DataSet, optional
         Boundary faces (3D meshes) or edges (``num_dim=2`` meshes) to write as
-        side sets, e.g. ``volume.extract_surface()`` or a subset of it. Each
-        surface cell must match the side of an element (see Notes). One side
-        set is written per value of ``surface.cell_data[region_key]`` (or a
-        single set without it).
+        side sets, e.g. ``volume.extract_surface()`` or a subset of it (for
+        quadratic cells use ``volume.extract_surface(nonlinear_subdivision=0)``:
+        by default pyvista splits each quadratic face into linear faces that
+        match no element side). Each surface cell must match the side of an
+        element (see Notes). One side set is written per value of
+        ``surface.cell_data[region_key]`` (or a single set without it).
     region_key : str, default "region"
         Name of the cell array that assigns cells to regions, on both
         ``volume`` and ``surface``. Integer or string values. Without it the
@@ -175,7 +226,8 @@ def write_exo(
         ``EXODUSII_COMPRESSION_LEVEL`` environment variable (1).
     side_set_tolerance : float, optional
         Largest distance between a surface point and the volume node it is
-        matched to. Default ``1e-6`` times the bounding-box diagonal.
+        matched to (its nearest node). Default ``1e-6`` times the
+        bounding-box diagonal.
     title : str, optional
         Database title (default ``"exovista"``).
 
@@ -210,19 +262,32 @@ def write_exo(
     ``exo_block_name`` and ``exo_elem_id`` arrays of :func:`exovista.read_exo`
     and the ``ObjectId``, ``GlobalElementId``, ``GlobalNodeId``,
     ``PedigreeElementId`` and ``PedigreeNodeId`` arrays of VTK's Exodus
-    reader. An element variable that is NaN on every element of a block (all
-    components, all steps) is not stored on that block (Exodus truth table),
-    which is how :func:`exovista.read_exo` reports variables that are
-    undefined on a block; it stays stored everywhere if it is NaN on every
-    block.
+    reader (and its ``ImplicitElementId``, ``ImplicitNodeId``,
+    ``SourceElementId`` and ``SourceElementSide``). Integer arrays beyond
+    ``2**53`` (``2**24`` with ``precision="single"``) lose exactness and are
+    reported with a warning, as are variables named like the components of
+    another array (a scalar ``U_Z`` next to a 2-component ``U``: readers
+    would regroup them differently).
+
+    **Undefined values.** An element variable that is NaN on every element
+    of a block (all components, all steps) is not stored on that block
+    (Exodus truth table), which is how :func:`exovista.read_exo` reports
+    variables that are undefined on a block; it stays stored everywhere if
+    it is NaN on every block. The components of an array, and all variables
+    VTK's reader glues into one array (``<name>X/Y/Z``), are decided
+    together (VTK crashes on a glued array stored on different blocks), so
+    a block is left out only when all of them are NaN there. meshio (<= 5.3)
+    cannot read files whose truth table leaves out a block; fill such
+    arrays with a value instead of NaN if the file is meant for meshio.
 
     **Writing a mesh read by** :func:`exovista.read_exo`: pass
     ``region_key="exo_block_id"`` to keep its element blocks (and their ids)
     and ``block_names`` to keep their names; ``region_key`` also names the
     region array of ``surface``.
 
-    **Side sets.** Surface points are matched to volume nodes within
-    ``side_set_tolerance`` and each surface cell's corner nodes are looked up
+    **Side sets.** Each surface point is matched to its nearest volume node
+    (within ``side_set_tolerance``; exact duplicates of that node count as
+    the same node) and each surface cell's corner nodes are looked up
     among the sides of the solid elements (3D meshes) or the edges of the 2D
     elements (``num_dim=2``); shells, bars and spheres are not side-set
     targets. Quadratic cells match by their corner nodes. A face shared by
@@ -243,7 +308,7 @@ def write_exo(
     compression_level = _compression_level(compression_level)
     notes: list[str] = []
 
-    grid, regions = _prepare_volume(volume, region_key)
+    grid, regions, vtk_sets = _prepare_volume(volume, region_key, notes)
     cells = _collect_cells(grid, num_dim)
     layout = _layout_blocks(cells, regions, block_names)
     side_sets = []
@@ -253,14 +318,20 @@ def write_exo(
             side_set_tolerance, notes,
         )
     nsets = _build_node_sets(node_sets, cells.n_points)
+    if vtk_sets is not None:
+        side_sets, nsets = _use_vtk_sets(
+            vtk_sets, surface, node_sets, side_sets, nsets, cells, layout,
+            side_set_names, side_set_tolerance, notes,
+        )
     times_arr, node_vars, elem_vars, global_vars = _build_variables(
-        grid, cells, layout, region_key,
+        grid, cells, layout, region_key if vtk_sets is None else None,
         times=times,
         node_fields=node_fields,
         element_fields=element_fields,
         global_fields=global_fields,
         save_node_arrays=save_node_arrays,
         save_cell_arrays=save_cell_arrays,
+        float_word_size=float_word_size,
         notes=notes,
     )
     model = ExodusModel(
@@ -375,35 +446,342 @@ def _unique_strings(names: list[str]) -> list[str]:
     return out
 
 
-def _prepare_volume(volume, region_key):
-    """Return ``(grid, regions)``; the input is never modified."""
+def _is_exodus_reader_output(mb: pv.MultiBlock) -> bool:
+    """True for the MultiBlock layout of VTK's Exodus reader."""
+    keys = [mb.get_block_name(i) for i in range(mb.n_blocks)]
+    return (
+        "Element Blocks" in keys
+        and set(keys) <= _EXODUS_READER_KEYS
+        and isinstance(mb["Element Blocks"], pv.MultiBlock)
+    )
+
+
+def _merge_exact(points: np.ndarray):
+    """Merge points with identical coordinates (like ``merge_points=True``).
+
+    Returns ``(first, inverse)``: the input index of each merged point, in
+    order of first occurrence, and the merged index of every input point.
+    """
+    n = points.shape[0]
+    order = np.lexsort(points.T[::-1])  # stable: ties keep input order
+    srt = points[order]
+    new = np.ones(n, dtype=bool)
+    new[1:] = np.any(srt[1:] != srt[:-1], axis=1)
+    group = np.empty(n, dtype=np.int64)
+    group[order] = np.cumsum(new) - 1
+    first = order[new]  # smallest input index of every group
+    rank = np.empty(first.size, dtype=np.int64)
+    by_first = np.argsort(first, kind="stable")
+    rank[by_first] = np.arange(first.size)
+    return first[by_first], rank[group]
+
+
+def _combine_leaves(leaves: list, region_key, notes, node_key=None):
+    """One UnstructuredGrid from MultiBlock leaves (leaf after leaf).
+
+    Points with equal coordinates are merged (``merge_points=True``), or,
+    with ``node_key``, points with equal ids in that point array. Unlike
+    ``MultiBlock.combine``, arrays that only some leaves have are kept: cell
+    arrays are NaN on the other leaves' cells, point arrays NaN on points no
+    leaf with the array has (a merged point takes the first leaf's value that
+    is not NaN). Each leaf's ``region_key`` array is ignored (the leaves are
+    the regions).
+    """
+    grids = [_as_unstructured(leaf, "volume") for leaf in leaves]
+    points = np.concatenate(
+        [np.asarray(g.points, dtype=np.float64).reshape(-1, 3) for g in grids]
+    )
+    starts = np.cumsum([0] + [g.n_points for g in grids])
+    if node_key is not None and all(node_key in g.point_data for g in grids):
+        ids = np.concatenate(
+            [np.asarray(g.point_data[node_key]).reshape(-1) for g in grids]
+        )
+        _, first, inverse = np.unique(ids, return_index=True, return_inverse=True)
+        inverse = inverse.reshape(-1)
+    else:
+        first, inverse = _merge_exact(points)
+
+    celltypes = np.concatenate([np.asarray(g.celltypes, dtype=np.uint8)
+                                for g in grids])
+    offsets, connectivity, shift = [np.zeros(1, np.int64)], [], 0
+    for g, start in zip(grids, starts):
+        off = _cell_offsets(g)
+        offsets.append(off[1:] + shift)
+        shift += int(off[-1])
+        connectivity.append(
+            inverse[np.asarray(g.cell_connectivity, dtype=np.int64) + start]
+        )
+    grid = pv.UnstructuredGrid()
+    grid.points = points[first]
+    cell_array = pv.CellArray.from_arrays(
+        np.concatenate(offsets), np.concatenate(connectivity), deep=True
+    )
+    grid.SetCells(numpy_to_vtk(celltypes, deep=True), cell_array)
+
+    if region_key is not None and any(
+        region_key in g.cell_data.keys()
+        and np.unique(np.asarray(g.cell_data[region_key])).size > 1
+        for g in grids
+    ):
+        notes.append(
+            f"ignored the {region_key!r} cell array of the MultiBlock leaves: "
+            "each leaf is one region (combine the leaves yourself, e.g. "
+            "multiblock.combine(), to keep their own regions)"
+        )
+    n_cells = [g.n_cells for g in grids]
+    for name, values in _union_arrays(
+        [g.cell_data for g in grids], n_cells, "cell", notes, skip={region_key}
+    ):
+        grid.cell_data[name] = values
+    leaf_points = [inverse[a:b] for a, b in zip(starts[:-1], starts[1:])]
+    for name, parts in _union_arrays(
+        [g.point_data for g in grids], [g.n_points for g in grids], "point",
+        notes, combine=False,
+    ):
+        grid.point_data[name] = _merge_point_values(parts, leaf_points, first.size)
+    return grid
+
+
+def _union_arrays(datas: list, sizes: list, what: str, notes, skip=(),
+                  combine=True):
+    """Arrays of any leaf, as ``(name, values)``.
+
+    With ``combine`` the per-leaf values are concatenated (NaN for leaves
+    without the array), else ``values`` is the list of per-leaf arrays (None
+    for leaves without it). Arrays whose leaves disagree on the number of
+    components, and non-numeric arrays missing from some leaf, are skipped
+    with a note.
+    """
+    names = list(dict.fromkeys(
+        str(name) for data in datas for name in data.keys() if name not in skip
+    ))
+    for name in names:
+        parts = [np.asarray(d[name]) if name in d.keys() else None for d in datas]
+        present = [p for p in parts if p is not None]
+        widths = {p.reshape(p.shape[0], -1).shape[1] for p in present}
+        if len(widths) != 1:
+            notes.append(
+                f"skipped {what} array {name!r}: the MultiBlock leaves give it "
+                f"different numbers of components {sorted(widths)}"
+            )
+            continue
+        width = widths.pop()
+        missing = len(present) < len(parts)
+        numeric = all(p.dtype.kind in "biuf" for p in present)
+        if missing and not numeric:
+            notes.append(
+                f"skipped {what} array {name!r}: it is not numeric and not on "
+                "every MultiBlock leaf"
+            )
+            continue
+        if missing:
+            dtype = np.result_type(np.float64, *[p.dtype for p in present])
+            parts = [
+                np.full((n, width), np.nan, dtype=dtype) if p is None
+                else p.reshape(n, width).astype(dtype, copy=False)
+                for p, n in zip(parts, sizes)
+            ]
+        else:
+            parts = [p.reshape(n, width) for p, n in zip(parts, sizes)]
+        if combine:
+            values = np.concatenate(parts)
+            yield name, values[:, 0] if width == 1 else values
+        else:
+            yield name, parts
+
+
+def _merge_point_values(parts: list, leaf_points: list, n_points: int):
+    """Point array of the merged points: the first non-NaN leaf value wins."""
+    width = parts[0].shape[1]
+    dtype = np.result_type(*[p.dtype for p in parts])
+    floating = dtype.kind in "fc"
+    out = np.full((n_points, width), np.nan if floating else 0, dtype=dtype)
+    for values, index in zip(parts[::-1], leaf_points[::-1]):
+        if floating:
+            keep = ~np.isnan(values).all(axis=1)
+            values, index = values[keep], index[keep]
+        out[index] = values
+    return out[:, 0] if width == 1 else out
+
+
+def _vtk_padded_2d(leaves: list) -> set:
+    """``(kind, name)`` of the arrays VTK padded from 2 to 3 components.
+
+    In a 2D file VTK's reader returns 2-component vectors with a third
+    component of zeros. For a flat mesh at z = 0 without 3D cells (written
+    as a 2D file again), 3-component arrays whose third component is zero on
+    every leaf are taken to be such padded vectors.
+    """
+    for leaf in leaves:
+        if np.any(np.asarray(leaf.points)[:, 2] != 0):
+            return set()
+        if any(ct.exo_info_for(int(t), 3).dim == 3
+               for t in np.unique(np.asarray(leaf.celltypes))
+               if int(t) in ct.SUPPORTED_VTK_TYPES):
+            return set()
+    padded: dict = {}
+    for leaf in leaves:
+        for kind, data in (("point", leaf.point_data), ("cell", leaf.cell_data)):
+            for name in data.keys():
+                values = np.asarray(data[name])
+                zero = (
+                    values.ndim == 2 and values.shape[1] == 3
+                    and values.dtype.kind in "biuf" and not np.any(values[:, 2])
+                )
+                key = (kind, name)
+                padded[key] = padded.get(key, True) and zero
+    return {key for key, zero in padded.items() if zero}
+
+
+def _split_vtk_components(leaf: pv.DataSet, padded=frozenset()) -> pv.DataSet:
+    """A shallow copy of a VTK-reader leaf with its glued vectors split.
+
+    VTK's Exodus reader glues variables ``<b>X, <b>Y[, <b>Z]`` into one array
+    named ``<b>`` (e.g. ``vel_X`` -> ``vel_``, ``t_XX/t_XY/t_XZ`` -> ``t_X``);
+    writing the scalars back under their original names makes the round trip
+    exact instead of renaming them ``vel__X`` etc. ``padded`` names the
+    3-component arrays that are 2-component vectors padded by VTK.
+    """
+    out = leaf.copy(deep=False)
+    for kind, data in (("point", out.point_data), ("cell", out.cell_data)):
+        for name in list(data.keys()):
+            values = np.asarray(data[name])
+            if values.ndim != 2 or values.shape[1] not in (2, 3):
+                continue
+            if values.dtype.kind not in "biuf" or name in _EXCLUDED_ARRAYS:
+                continue
+            n = 2 if (kind, name) in padded else values.shape[1]
+            new = [name + c for c in "XYZ"[:n]]
+            if any(c in data.keys() for c in new):
+                continue
+            del data[name]
+            for k, component in enumerate(new):
+                data[component] = np.ascontiguousarray(values[:, k])
+    return out
+
+
+def _leaf_id(leaf: pv.DataSet, field: str | None):
+    """Exodus id of a VTK-reader leaf (``ObjectId`` or a field array)."""
+    if "ObjectId" in leaf.cell_data.keys():
+        ids = np.unique(np.asarray(leaf.cell_data["ObjectId"]))
+        if ids.size == 1:
+            return int(ids[0])
+    if field and field in leaf.field_data.keys():
+        ids = np.asarray(leaf.field_data[field]).reshape(-1)
+        if ids.size == 1 and ids.dtype.kind in "iu":
+            return int(ids[0])
+    return None
+
+
+#: Names VTK's reader gives unnamed blocks and sets.
+_VTK_UNNAMED = re.compile(r"^Unnamed (block|set) ID: -?\d+")
+
+
+def _vtk_names(leaves: list) -> list:
+    """Leaf names, None for VTK's made-up names of unnamed entities."""
+    names = [None if _VTK_UNNAMED.match(name) else name for name, _ in leaves]
+    given = _unique_strings([n for n in names if n is not None])
+    it = iter(given)
+    return [None if n is None else next(it) for n in names]
+
+
+def _vtk_ids(leaves: list, field: str | None) -> list | None:
+    ids = [_leaf_id(leaf, field) for _, leaf in leaves]
+    if None in ids or len(set(ids)) != len(ids):
+        return None
+    return ids
+
+
+@dataclass
+class _VtkSets:
+    """Side and node sets found in VTK Exodus-reader output."""
+
+    side_leaves: list  # (name, dataset)
+    node_leaves: list  # (name, dataset)
+    node_ids: np.ndarray | None  # global node id of each merged point
+
+
+def _from_exodus_reader(blocks: pv.MultiBlock, mb, notes):
+    """Volume, regions and sets of VTK Exodus-reader output.
+
+    ``blocks`` is its "Element Blocks" MultiBlock, ``mb`` the whole output
+    (None when only the element blocks were passed: then there are no sets).
+    """
+    leaves = _leaves(blocks, [])
+    if not leaves:
+        raise ValueError("cannot write an empty mesh: 'Element Blocks' has no cells")
+    padded = _vtk_padded_2d([leaf for _, leaf in leaves])
+    leaves = [(name, _split_vtk_components(leaf, padded)) for name, leaf in leaves]
+    names = _vtk_names(leaves)
+    ids = _vtk_ids(leaves, "ElementBlockIds")
+    # (the blocks are the regions: a "region" array is an ordinary variable)
+    grid = _combine_leaves(
+        [leaf for _, leaf in leaves], None, notes, node_key="GlobalNodeId"
+    )
+    node_ids = None
+    if "GlobalNodeId" in grid.point_data.keys():
+        node_ids = np.asarray(grid.point_data["GlobalNodeId"]).reshape(-1)
+    labels = np.repeat(np.arange(len(leaves)), [leaf.n_cells for _, leaf in leaves])
+    if ids is None:
+        values, integral = list(range(1, len(leaves) + 1)), True
+        code = labels
+    else:
+        order = np.argsort(ids, kind="stable")
+        values = [ids[i] for i in order]
+        rank = np.empty(len(ids), dtype=np.int64)
+        rank[order] = np.arange(len(ids))
+        code = rank[labels]
+        names = [names[i] for i in order]
+        integral = min(values) >= 1 and max(values) <= _INT32_MAX
+    regions = _Regions(values, code.astype(np.int64), names, integral)
+
+    def set_leaves(key):
+        block = mb[key] if mb is not None and key in mb.keys() else None
+        return [] if not isinstance(block, pv.MultiBlock) else _leaves(block, [])
+
+    ignored = [
+        key for key in ("Face Blocks", "Edge Blocks", "Element Sets", "Face Sets",
+                        "Edge Sets")
+        if set_leaves(key)
+    ]
+    if ignored:
+        notes.append(
+            f"ignored the {', '.join(map(repr, ignored))} of the VTK reader "
+            "output (only element blocks, side sets and node sets are written)"
+        )
+    sets = _VtkSets(set_leaves("Side Sets"), set_leaves("Node Sets"), node_ids)
+    return grid, regions, sets
+
+
+def _prepare_volume(volume, region_key, notes):
+    """Return ``(grid, regions, vtk_sets)``; the input is never modified.
+
+    ``vtk_sets`` holds the side / node sets of VTK Exodus-reader output (None
+    for any other input).
+    """
     if isinstance(volume, vtkDataObject) and not isinstance(volume, pv.DataObject):
         volume = pv.wrap(volume)
     if isinstance(volume, pv.MultiBlock):
+        if _is_exodus_reader_output(volume):
+            return _from_exodus_reader(volume["Element Blocks"], volume, notes)
         leaves = _leaves(volume, [])
         if not leaves:
             raise ValueError("cannot write an empty mesh: the MultiBlock has no cells")
+        if all("ElementBlockIds" in leaf.field_data.keys() for _, leaf in leaves):
+            # the "Element Blocks" of VTK's Exodus reader output
+            return _from_exodus_reader(volume, None, notes)
         names = _unique_strings([name for name, _ in leaves])
-        if len(leaves) == 1:
-            grid = _as_unstructured(leaves[0][1], "volume")
-            labels = np.zeros(grid.n_cells, dtype=np.int64)
-        else:
-            tag = "__exovista_leaf__"
-            combined = pv.MultiBlock()
-            for i, (_, leaf) in enumerate(leaves):
-                leaf = leaf.copy(deep=False)  # shares arrays, never the caller's
-                leaf.cell_data[tag] = np.full(leaf.n_cells, i, dtype=np.int32)
-                combined.append(leaf)
-            grid = combined.combine(merge_points=True)
-            labels = np.asarray(grid.cell_data[tag], dtype=np.int64)
-            del grid.cell_data[tag]  # our own object
+        grid = _combine_leaves([leaf for _, leaf in leaves], region_key, notes)
+        labels = np.repeat(
+            np.arange(len(leaves), dtype=np.int64), [leaf.n_cells for _, leaf in leaves]
+        )
         regions = _Regions(
             values=list(range(1, len(leaves) + 1)),
             code=labels,
             defaults=names,
             integral=True,
         )
-        return grid, regions
+        return grid, regions, None
 
     grid = _as_unstructured(volume, "volume")
     if grid.n_cells == 0 or grid.n_points == 0:
@@ -411,7 +789,76 @@ def _prepare_volume(volume, region_key):
             f"cannot write an empty mesh ({grid.n_points} points, "
             f"{grid.n_cells} cells)"
         )
-    return grid, _regions_of(grid, region_key, "volume")
+    return grid, _regions_of(grid, region_key, "volume"), None
+
+
+def _use_vtk_sets(sets: _VtkSets, surface, node_sets, side_sets, nsets, cells,
+                  layout, side_set_names, tolerance, notes):
+    """Side sets and node sets from VTK Exodus-reader output.
+
+    Sets the caller passed explicitly (``surface``, ``node_sets``) win.
+    Returns ``(side_sets, nsets)``.
+    """
+    if sets.side_leaves and surface is not None:
+        notes.append(
+            "ignored the 'Side Sets' of the VTK reader output: surface= was given"
+        )
+    elif sets.side_leaves:
+        ids = _vtk_ids(sets.side_leaves, None)
+        if ids is None:
+            ids = list(range(1, len(sets.side_leaves) + 1))
+        names = _vtk_names(sets.side_leaves)
+        pieces = []
+        for set_id, (_, leaf) in zip(ids, sets.side_leaves):
+            piece = _as_unstructured(leaf, "surface").copy(deep=False)
+            piece.clear_data()
+            piece.cell_data[_SET_KEY] = np.full(piece.n_cells, set_id, np.int64)
+            pieces.append(piece)
+        surf = pv.MultiBlock(pieces).combine(merge_points=False)
+        if side_set_names is None:
+            side_set_names = dict(zip(ids, names))
+        try:
+            side_sets = _build_side_sets(
+                surf, cells, layout, _SET_KEY, side_set_names, tolerance, notes
+            )
+        except ValueError as err:
+            notes.append(f"could not convert the VTK reader's side sets: {err}")
+            side_sets = []
+    if sets.node_leaves and node_sets is not None:
+        notes.append(
+            "ignored the 'Node Sets' of the VTK reader output: node_sets= was given"
+        )
+    elif sets.node_leaves:
+        ids = _vtk_ids(sets.node_leaves, None)
+        if ids is None:
+            ids = list(range(1, len(sets.node_leaves) + 1))
+        names = [
+            f"node_set_{i}" if name is None else name
+            for i, name in zip(ids, _vtk_names(sets.node_leaves))
+        ]
+        nsets, tree = [], None
+        for set_id, name, (_, leaf) in zip(ids, names, sets.node_leaves):
+            gids = leaf.point_data.get("GlobalNodeId")
+            if gids is not None and sets.node_ids is not None:
+                gids = np.asarray(gids).reshape(-1)
+                order = np.argsort(sets.node_ids)
+                pos = np.searchsorted(sets.node_ids[order], gids)
+                pos = np.minimum(pos, order.size - 1)
+                found = sets.node_ids[order][pos] == gids
+                index = order[pos]
+            else:
+                if tree is None:
+                    tree = cKDTree(cells.points)
+                dist, index = tree.query(np.asarray(leaf.points, dtype=np.float64))
+                found = dist == 0
+            if not found.all():
+                notes.append(
+                    f"skipped node set {name!r} of the VTK reader output: "
+                    f"{int((~found).sum())} of its points are not mesh nodes"
+                )
+                continue
+            nsets.append(NodeSet(set_id, name, np.unique(index)))
+    return side_sets, nsets
 
 
 def _regions_of(mesh, region_key, what) -> _Regions:
@@ -735,29 +1182,22 @@ def _surface_corners(surf: pv.UnstructuredGrid):
     }
 
 
-def _match_points(query: np.ndarray, points: np.ndarray, tol: float):
-    """Map ``query`` points to volume nodes within ``tol``.
+def _match_points(query: np.ndarray, points: np.ndarray, tol: float, same: float):
+    """Map ``query`` points to their nearest volume node within ``tol``.
 
-    Returns ``(node, canon)``: the node of every query point and, when some
-    query points have several coincident volume nodes (duplicate nodes), an
-    array mapping every volume node to the lowest coincident node index
-    (``None`` otherwise). ``node`` is already canonical.
+    Returns ``(node, canon)``: the node of every query point and, when the
+    volume has duplicate nodes (closer than ``same`` to a matched node, e.g.
+    an unmerged mesh), an array mapping every volume node to the lowest index
+    among its duplicates (``None`` otherwise). ``node`` is already canonical.
+    Only the nearest node and its exact duplicates are used: other nodes
+    within ``tol`` (thin elements, large tolerances) are distinct nodes.
     """
     tree = cKDTree(points, balanced_tree=False, compact_nodes=False)
     # cKDTree compares squared distances: keep the bound's square > 0 so that
     # tol=0 still finds exact matches (filtered with ``dist <= tol`` below).
     bound = max(tol * (1.0 + 1e-9), 1e-150)
-    n_points = points.shape[0]
-    k = min(4, n_points)
-    while True:
-        dist, idx = tree.query(query, k=k, distance_upper_bound=bound)
-        dist = dist.reshape(len(query), k)
-        idx = idx.reshape(len(query), k)
-        if k >= n_points or not np.isfinite(dist[:, -1]).any():
-            break
-        k = min(2 * k, n_points)
-    found = dist <= tol
-    missing = ~found[:, 0]
+    dist, nearest = tree.query(query, k=1, distance_upper_bound=bound)
+    missing = ~(dist <= tol)
     if missing.any():
         far, _ = tree.query(query[missing])
         raise ValueError(
@@ -767,14 +1207,26 @@ def _match_points(query: np.ndarray, points: np.ndarray, tol: float):
             "mesh. Pass a larger side_set_tolerance if it is only approximately "
             "on the mesh."
         )
+    nearest = np.asarray(nearest, dtype=np.int64)
+    matched = np.unique(nearest)
+    n_points = points.shape[0]
+    bound = max(same * (1.0 + 1e-9), 1e-150)
+    k = min(4, n_points)
+    while True:
+        dist, idx = tree.query(points[matched], k=k, distance_upper_bound=bound)
+        dist = dist.reshape(matched.size, k)
+        idx = idx.reshape(matched.size, k)
+        if k >= n_points or not np.isfinite(dist[:, -1]).any():
+            break
+        k = min(2 * k, n_points)
+    found = dist <= same
     if not found[:, 1:].any():
-        return idx[:, 0], None
-    masked = np.where(found, idx, n_points)
-    rep = masked.min(axis=1)
+        return nearest, None
+    rep = np.where(found, idx, n_points).min(axis=1)
     canon = np.arange(n_points)
     rows, cols = np.nonzero(found)
     np.minimum.at(canon, idx[rows, cols], rep[rows])
-    return canon[rep], canon
+    return canon[nearest], canon
 
 
 def _side_candidates(cells: _Cells, layout: _Layout, mark, canon):
@@ -900,15 +1352,34 @@ def _build_side_sets(surface, cells: _Cells, layout: _Layout, region_key,
     surf_points = np.asarray(surf.points, dtype=np.float64)
     used = np.unique(np.concatenate([c.reshape(-1) for _, c in groups.values()]))
     node_of = np.full(surf.n_points, -1, dtype=np.int64)
-    node_of[used], canon = _match_points(surf_points[used], cells.points, tol)
+    node_of[used], canon = _match_points(
+        surf_points[used], cells.points, tol, _COINCIDENT_RTOL * diag
+    )
     mark = np.zeros(cells.n_points, dtype=bool)
     mark[node_of[used]] = True
-    candidates = _side_candidates(cells, layout, mark, canon)
 
+    keys_of = {}
+    collapsed = []
+    for k, (surf_cells, corners) in groups.items():
+        keys = np.sort(node_of[corners], axis=1)
+        repeated = np.any(keys[:, 1:] == keys[:, :-1], axis=1)
+        if repeated.any():
+            collapsed.append(surf_cells[repeated])
+        keys_of[k] = keys
+    if collapsed:
+        bad = np.sort(np.concatenate(collapsed))
+        raise ValueError(
+            f"{bad.size} surface cell(s) have two or more corners on the same "
+            f"volume node (first: surface cell {int(bad[0])}): the surface has "
+            "degenerate cells, or side_set_tolerance "
+            f"({tol:.6g}) is larger than the distance between distinct nodes"
+        )
+
+    candidates = _side_candidates(cells, layout, mark, canon)
     elem_of = np.full(surf.n_cells, -1, dtype=np.int64)
     side_of = np.zeros(surf.n_cells, dtype=np.int64)
     for k, (surf_cells, corners) in groups.items():
-        keys = np.sort(node_of[corners], axis=1)
+        keys = keys_of[k]
         if k not in candidates:
             continue
         cand_keys, cand_elem, cand_side = candidates[k]
@@ -935,11 +1406,18 @@ def _build_side_sets(surface, cells: _Cells, layout: _Layout, region_key,
             "faces of the 3D elements" if cells.num_dim == 3
             else "edges of the 2D elements (use line cells)"
         )
+        hint = ""
+        if any(info.n_nodes > info.n_corners for info in layout.infos):
+            hint = (
+                " The volume has quadratic cells: extract their faces unsplit "
+                "with volume.extract_surface(nonlinear_subdivision=0) (the "
+                "default subdivides each quadratic face into linear ones)."
+            )
         raise ValueError(
             f"{unmatched.size} of {surf.n_cells} surface cell(s) do not match a "
             f"side of any element (first: surface cell {int(unmatched[0])}). "
             f"Side sets are matched to the {targets}; shell, bar and sphere "
-            "elements are not side-set targets."
+            "elements are not side-set targets." + hint
         )
 
     ids = _region_ids(regions)
@@ -1060,16 +1538,34 @@ def _times(times):
     return arr
 
 
-def _numeric(values, what) -> np.ndarray:
+def _numeric(values, what, word_size=8, notes=None) -> np.ndarray:
     arr = np.asarray(values)
     if arr.dtype.kind not in "biuf":
         raise TypeError(f"{what} must be numeric, got dtype {arr.dtype}")
+    if notes is not None:
+        _check_exact_ints(arr, what, word_size, notes)
     return arr.astype(np.float64, copy=False)
 
 
-def _field(values, n_steps, n, name, kind, implicit_times) -> np.ndarray:
+def _check_exact_ints(arr: np.ndarray, what: str, word_size: int, notes) -> None:
+    """Note integer values that the float storage cannot hold exactly."""
+    if arr.dtype.kind not in "iu" or arr.size == 0:
+        return
+    limit = _EXACT_INT[word_size]
+    biggest = max(int(arr.max()), -int(arr.min()))
+    if biggest > limit:
+        precision = "single" if word_size == 4 else "double"
+        notes.append(
+            f"{what} holds integers up to {biggest}, beyond what {precision} "
+            f"precision floats store exactly (2**{limit.bit_length() - 1}): "
+            "nearby values become equal in the file"
+        )
+
+
+def _field(values, n_steps, n, name, kind, implicit_times, word_size=8,
+           notes=None) -> np.ndarray:
     """Time-varying field as ``(n_steps, n, n_components)`` float64."""
-    arr = _numeric(values, f"{kind} field {name!r}")
+    arr = _numeric(values, f"{kind} field {name!r}", word_size, notes)
     if arr.ndim == 1 and n_steps == 1 and arr.shape[0] == n:
         return arr.reshape(1, n, 1)
     if arr.ndim == 2:
@@ -1100,7 +1596,7 @@ def _components(name, arr):
     ]
 
 
-def _static(values, name, what, notes):
+def _static(values, name, what, notes, word_size=8):
     """A point / cell array as float64 ``(n, n_components)``, or None (skipped)."""
     arr = np.asarray(values)
     kind = arr.dtype.kind
@@ -1110,6 +1606,7 @@ def _static(values, name, what, notes):
     if kind not in "biuf":
         notes.append(f"skipped {what} array {name!r}: non-numeric dtype {arr.dtype}")
         return None
+    _check_exact_ints(arr, f"{what} array {name!r}", word_size, notes)
     arr = arr.reshape(arr.shape[0], -1).astype(np.float64, copy=False)
     if arr.shape[1] == 0:
         return None
@@ -1140,14 +1637,66 @@ def _all_nan(values: np.ndarray) -> bool:
     return bool(np.isnan(values).all())
 
 
-def _drop_undefined_blocks(elem_vars: dict, groups: list) -> None:
-    """Leave out the blocks on which a source array is NaN everywhere.
+def _vtk_family(name: str) -> str:
+    """Key shared by all variables VTK's reader may glue into one array.
 
-    A block is dropped from all component variables of an array together
-    (VTK's reader cannot handle the components of one vector stored on
-    different blocks), and only if the array is defined on some block.
+    VTK glues variables named ``<base>X, <base>Y[, <base>Z]`` (any case) into
+    a vector ``<base>``; tensors ``<b>XX, <b>XY, <b>XZ`` give ``<b>X`` etc.
+    Removing up to two trailing x/y/z letters (and then one ``_``) maps every
+    member of such a group to one key (a superset of VTK's groups).
     """
-    for names in groups:
+    key = name.upper()
+    for _ in range(2):
+        if key and key[-1] in "XYZ":
+            key = key[:-1]
+    return key[:-1] if key.endswith("_") else key
+
+
+def _variable_families(names: list, sources: list) -> list:
+    """Groups of element variables whose truth-table rows must agree.
+
+    Joins the components of each source array (``sources``) and every set of
+    variables VTK's reader would glue into one array: VTK cannot read a glued
+    array whose components are stored on different blocks (it crashes).
+    """
+    parent = {name: name for name in names}
+
+    def find(name):
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for group in sources:
+        for other in group[1:]:
+            union(group[0], other)
+    by_family: dict[str, str] = {}
+    for name in names:
+        key = _vtk_family(name)
+        if key in by_family:
+            union(by_family[key], name)
+        else:
+            by_family[key] = name
+    families: dict[str, list] = {}
+    for name in names:
+        families.setdefault(find(name), []).append(name)
+    return list(families.values())
+
+
+def _drop_undefined_blocks(elem_vars: dict, families: list) -> None:
+    """Leave out the blocks on which a variable family is NaN everywhere.
+
+    A block is dropped from all variables of a family together (VTK's reader
+    crashes on the components of one glued vector stored on different
+    blocks), only if every variable of the family is NaN on it, and only if
+    the family is defined on some block.
+    """
+    for names in families:
         per_block = [elem_vars[name] for name in names]
         block_ids = list(per_block[0])
         undefined = [
@@ -1160,9 +1709,30 @@ def _drop_undefined_blocks(elem_vars: dict, groups: list) -> None:
                     del values[block_id]
 
 
+def _check_recombination(names: list, intended: dict, kind: str, notes) -> None:
+    """Note multi-component arrays that will not read back as written.
+
+    ``intended`` maps each split array's name to its scalar names; readers
+    regroup the scalars by name (:func:`exovista._model.component_groups`),
+    so another variable named like a component of it (``U_Z`` next to a
+    2-component ``U``) changes the result.
+    """
+    groups = component_groups(names)
+    wrong = [
+        base for base, members in intended.items()
+        if groups.get(base) != members
+    ]
+    if wrong:
+        notes.append(
+            f"{kind} array(s) {wrong} will not be recombined as written when the "
+            "file is read: other variables are named like their components "
+            "(e.g. a scalar 'U_Z' next to a 2-component 'U'); rename them"
+        )
+
+
 def _build_variables(grid, cells: _Cells, layout: _Layout, region_key, *, times,
                      node_fields, element_fields, global_fields, save_node_arrays,
-                     save_cell_arrays, notes):
+                     save_cell_arrays, notes, float_word_size=8):
     node_fields = _check_mapping(node_fields, "node_fields")
     element_fields = _check_mapping(element_fields, "element_fields")
     global_fields = _check_mapping(global_fields, "global_fields")
@@ -1170,24 +1740,36 @@ def _build_variables(grid, cells: _Cells, layout: _Layout, region_key, *, times,
     implicit = times_arr is None
     n_steps = 1 if implicit else times_arr.size
     n_points, n_cells = cells.n_points, cells.n_cells
+    ws = float_word_size
+
+    # scalar variable names of each multi-component source array
+    node_split: dict = {}
+    elem_split: dict = {}
+
+    def split(target, name, parts):
+        if len(parts) > 1:
+            target[name.rstrip()] = [s.rstrip() for s, _ in parts]
 
     # time-varying fields (their names win over static arrays)
     node_tv: dict = {}
     for name, values in node_fields.items():
-        arr = _field(values, n_steps, n_points, name, "node", implicit)
-        for scalar, col in _components(name, arr):
+        arr = _field(values, n_steps, n_points, name, "node", implicit, ws, notes)
+        parts = _components(name, arr)
+        for scalar, col in parts:
             _add(node_tv, scalar, col, f"node field {name!r}")
+        split(node_split, name, parts)
     elem_tv: dict = {}
     elem_groups: list = []  # scalar variable names of each source array
     for name, values in element_fields.items():
-        arr = _field(values, n_steps, n_cells, name, "element", implicit)
+        arr = _field(values, n_steps, n_cells, name, "element", implicit, ws, notes)
         parts = _components(name, arr)
         for scalar, col in parts:
             _add(elem_tv, scalar, col, f"element field {name!r}")
         elem_groups.append([s.rstrip() for s, _ in parts])
+        split(elem_split, name, parts)
     global_vars: dict = {}
     for name, values in global_fields.items():
-        arr = _numeric(values, f"global field {name!r}")
+        arr = _numeric(values, f"global field {name!r}", ws, notes)
         if arr.ndim == 0 and n_steps == 1:
             arr = arr.reshape(1, 1)
         elif arr.ndim == 1 and arr.shape[0] == n_steps:
@@ -1206,7 +1788,7 @@ def _build_variables(grid, cells: _Cells, layout: _Layout, region_key, *, times,
         for name in grid.point_data.keys():
             if name in _EXCLUDED_ARRAYS or name in node_fields:
                 continue
-            arr = _static(grid.point_data[name], name, "point", notes)
+            arr = _static(grid.point_data[name], name, "point", notes, ws)
             if arr is None:
                 continue
             parts = _components(name, arr)
@@ -1220,13 +1802,14 @@ def _build_variables(grid, cells: _Cells, layout: _Layout, region_key, *, times,
                 continue
             for scalar, col in parts:
                 node_static[scalar.rstrip()] = np.broadcast_to(col, (n_steps, n_points))
+            split(node_split, name, parts)
     elem_static: dict = {}
     if save_cell_arrays:
         for name in grid.cell_data.keys():
             if (name in _EXCLUDED_ARRAYS or name == region_key
                     or name in element_fields):
                 continue
-            arr = _static(grid.cell_data[name], name, "cell", notes)
+            arr = _static(grid.cell_data[name], name, "cell", notes, ws)
             if arr is None:
                 continue
             parts = _components(name, arr)
@@ -1241,6 +1824,7 @@ def _build_variables(grid, cells: _Cells, layout: _Layout, region_key, *, times,
             for scalar, col in parts:
                 elem_static[scalar.rstrip()] = col
             elem_groups.append([s.rstrip() for s, _ in parts])
+            split(elem_split, name, parts)
 
     node_vars = {**node_static, **node_tv}
     elem_vars = {}
@@ -1259,7 +1843,11 @@ def _build_variables(grid, cells: _Cells, layout: _Layout, region_key, *, times,
             block.id: ordered[:, layout.offsets[b]: layout.offsets[b + 1]]
             for b, block in enumerate(layout.blocks)
         }
-    _drop_undefined_blocks(elem_vars, elem_groups)
+    _drop_undefined_blocks(
+        elem_vars, _variable_families(list(elem_vars), elem_groups)
+    )
+    _check_recombination(list(node_vars), node_split, "point", notes)
+    _check_recombination(list(elem_vars), elem_split, "cell", notes)
 
     has_vars = bool(node_vars or elem_vars or global_vars)
     if times_arr is None:

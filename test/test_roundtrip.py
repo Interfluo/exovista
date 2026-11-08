@@ -33,6 +33,7 @@ import pytest
 import pyvista as pv
 from pyvista import examples
 from scipy.spatial import cKDTree
+from meshio.exodus._exodus import categorize as meshio_categorize
 from vtkmodules.vtkIOExodus import vtkExodusIIReader
 
 from exovista import (
@@ -45,6 +46,7 @@ from exovista import (
     write_exo,
 )
 from exovista._backend import open_reader
+from exovista._model import component_suffixes
 
 CT = pv.CellType
 DATA = os.path.join(os.path.dirname(os.path.realpath(__file__)), "data")
@@ -600,11 +602,15 @@ def shells_3d():
     mb = pv.MultiBlock({"sphere": sphere, "patch": patch})
     combined = pv.MultiBlock(
         {"sphere": sphere.copy(), "patch": patch.copy()}).combine(merge_points=True)
+    # arrays of only some leaves are kept (NaN elsewhere); combine() drops them
+    texture = np.full((combined.n_points, 2), np.nan)
+    _, at = cKDTree(combined.points).query(patch.points)
+    texture[at] = patch.point_data["TextureCoordinates"]
+    combined.point_data["TextureCoordinates"] = texture
     is_tri = combined.celltypes == CT.TRIANGLE
     case = Case(
         mb, combined, 3, np.where(is_tri, 1, 2), np.where(is_tri, "sphere", "patch"),
         node_sets={"north": [int(np.argmax(combined.points[:, 2]))]},
-        meshio=False,  # meshio (<= 5.3) does not know TRISHELL
     )
     return _histories(case, 11)
 
@@ -834,6 +840,30 @@ def test_meshio_reads_it(written):
         tuple(conn[offsets[i]: offsets[i + 1]].tolist())
         for i in np.flatnonzero(np.isin(types, list(LINEAR))))
     assert got_cells == want
+    # names are NUL padded (like the Exodus C library), so meshio, which does
+    # not strip blanks, gets the plain variable and set names
+    assert set(mesh.point_data) == _meshio_names(case.node_history(), group=True)
+    assert set(mesh.cell_data) == _meshio_names(case.element_history())
+    # (meshio skips empty node sets but keeps their names, shifting the rest)
+    assert set(mesh.point_sets) <= set(case.node_sets)
+    assert len(mesh.point_sets) == sum(len(v) > 0 for v in case.node_sets.values())
+
+
+def _meshio_names(histories, group=False):
+    """meshio's array names for the scalar Exodus variables of ``histories``
+    (for point data meshio groups ``<name>X/Y[/Z]`` itself, keeping
+    ``<name>``)."""
+    names = []
+    for name, values in histories.items():
+        values = np.asarray(values)
+        if values.ndim == 3 and values.shape[2] > 1:
+            names += [name + s for s in component_suffixes(values.shape[2])]
+        else:
+            names.append(name)
+    if not group:
+        return set(names)
+    single, double, triple = meshio_categorize(names)
+    return {group[0] for group in single + double + triple}
 
 
 # --------------------------------------------------------------------------- #

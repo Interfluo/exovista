@@ -15,6 +15,7 @@ import pytest
 import pyvista as pv
 from pyvista.examples import cells as example_cells
 
+from exovista import _celltypes as ct
 from exovista._backend import open_reader
 from exovista._celltypes import UnsupportedCellTypeError
 from exovista.write_pyvista import write_exo
@@ -23,14 +24,15 @@ CT = pv.CellType
 
 # VTK type -> (Exodus type in a num_dim=2 file, in a num_dim=3 file). Spelled
 # out here, independently of exovista._celltypes. The linear tetrahedron, wedge
-# and pyramid are written as TETRA / WEDGE / PYRAMID (which meshio can read;
-# every Exodus reader takes the first three letters plus the node count).
+# and pyramid are written as TETRA / WEDGE / PYRAMID and triangular shells as
+# TRI3 / TRI6 (which meshio can read; every Exodus reader takes the first three
+# letters plus the node count, and a TRI in a 3D file is a triangular shell).
 EXPECTED_EXO_TYPE = {
     CT.VERTEX: ("SPHERE", "SPHERE"),
     CT.LINE: ("BAR2", "BAR2"),
     CT.QUADRATIC_EDGE: ("BAR3", "BAR3"),
-    CT.TRIANGLE: ("TRI3", "TRISHELL3"),
-    CT.QUADRATIC_TRIANGLE: ("TRI6", "TRISHELL6"),
+    CT.TRIANGLE: ("TRI3", "TRI3"),
+    CT.QUADRATIC_TRIANGLE: ("TRI6", "TRI6"),
     CT.QUAD: ("QUAD4", "SHELL4"),
     CT.PIXEL: ("QUAD4", "SHELL4"),
     CT.QUADRATIC_QUAD: ("QUAD8", "SHELL8"),
@@ -366,7 +368,12 @@ def test_2d_cells_in_3d_are_shells(tmp_path):
     write_exo(tmp_path / "shells.exo", grid)
     num_dim, types = _num_dim_and_types(tmp_path / "shells.exo")
     assert num_dim == 3
-    assert types == ["TRISHELL3", "TRISHELL6", "SHELL4", "SHELL8", "QUAD9", "SHELL4"]
+    # TRI3 / TRI6 in a 3D file are triangular shells (Exodus library, VTK)
+    assert types == ["TRI3", "TRI6", "SHELL4", "SHELL8", "QUAD9", "SHELL4"]
+    with open_reader(tmp_path / "shells.exo") as r:
+        resolved = [ct.resolve_exo_type(b.elem_type, b.n_nodes_per_elem, r.num_dim)
+                    for b in r.blocks()]
+    assert [t.name for t in resolved[:2]] == ["TRISHELL3", "TRISHELL6"]
     assert_cells_match(tmp_path / "shells.exo", grid)
 
 
@@ -423,7 +430,8 @@ def test_multiblock_region_arrays_ignored_and_types_split(tmp_path):
     hexes.cell_data["region"] = [7, 8]  # each leaf is one region regardless
     mixed = mixed_grid().translate((10, 0, 0))
     mb = pv.MultiBlock({"hexes": hexes, "mixed": mixed})
-    write_exo(tmp_path / "m.exo", mb, block_names={1: "H"})
+    with pytest.warns(UserWarning, match="ignored the 'region' cell array"):
+        write_exo(tmp_path / "m.exo", mb, block_names={1: "H"})
     assert file_blocks(tmp_path / "m.exo") == [
         (1, "H", "HEX8", 2),
         (2, "mixed_hex8", "HEX8", 1),
@@ -456,7 +464,7 @@ def test_multiblock_single_leaf_and_all_empty(tmp_path):
             ["HEX8"],
         ),
         (lambda: pv.Plane(i_resolution=2, j_resolution=3), 6, ["QUAD4"]),
-        (lambda: pv.Sphere(theta_resolution=6, phi_resolution=6), 48, ["TRISHELL3"]),
+        (lambda: pv.Sphere(theta_resolution=6, phi_resolution=6), 48, ["TRI3"]),
     ],
     ids=["ImageData3D", "ImageData2D", "RectilinearGrid", "StructuredGrid",
          "PlanePolyData", "SpherePolyData"],
@@ -752,7 +760,8 @@ def test_precision(tmp_path):
     grid.point_data["T"] = 300.000123456789 + np.arange(grid.n_points)
     grid.point_data["I"] = 16777217 + np.arange(grid.n_points)  # > 2**24
     write_exo(tmp_path / "d.exo", grid, times=[1000.000000001])
-    write_exo(tmp_path / "s.exo", grid, precision="single")
+    with pytest.warns(UserWarning, match=r"'I' holds integers up to 16777228"):
+        write_exo(tmp_path / "s.exo", grid, precision="single")
     with netCDF4.Dataset(tmp_path / "d.exo") as nc:
         assert nc.variables["coordx"].dtype == np.float64
         assert nc.variables["vals_nod_var1"].dtype == np.float64

@@ -11,6 +11,27 @@ from .config import config
 from . import exodus_h as ex
 
 
+def _unique_ids(ids, return_inverse=False):
+    """``np.unique`` of non-negative integer ids, in O(n) when they are dense.
+
+    Global ids of a decomposition are usually ``1..N``: marking them in a
+    boolean array is much faster than sorting.
+    """
+    ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+    if ids.size and ids.min() >= 0 and ids.max() < 4 * ids.size + 1024:
+        mark = np.zeros(int(ids.max()) + 1, dtype=bool)
+        mark[ids] = True
+        uniq = np.flatnonzero(mark)
+        if not return_inverse:
+            return uniq
+        rank = np.cumsum(mark) - 1
+        return uniq, rank[ids]
+    if return_inverse:
+        uniq, inverse = np.unique(ids, return_inverse=True)
+        return uniq, inverse.reshape(-1)
+    return np.unique(ids)
+
+
 class parallel_exodusii_file(exodusii_file):
     """Parallel multi-file ExodusII file"""
 
@@ -132,15 +153,12 @@ class parallel_exodusii_file(exodusii_file):
         coords : ndarray of float
         """
         num_dim = self.num_dimensions()
+        index, _ = self._node_index()
         coords = np.zeros((self.num_nodes(), num_dim), dtype=float)
-
-        lid_to_gid = self.get_mapping(ex.maps.node_local_to_global, contiguous=True)
         for (fid, file) in enumerate(self.files):
-            num_nodes = self.get_dimension(file, ex.DIM_NUM_NODES)
-            gids = [lid_to_gid[(fid, lid)] - 1 for lid in range(1, num_nodes + 1)]
             x = _coords_from_file(file, num_dim)
-            assert x.shape[0] == num_nodes
-            coords[gids, :] = x
+            assert x.shape[0] == index[fid].size
+            coords[index[fid], :] = x
         if time_step is not None:
             coords += self.get_displ(time_step)
         return coords
@@ -402,6 +420,8 @@ class parallel_exodusii_file(exodusii_file):
         """
         num_row = self.num_elems_in_blk(block_id)
         if type == ex.types.node:
+            return self._element_node_conn(block_id, num_row)
+        if type == ex.types.node:
             var = lambda iid: ex.VAR_ELEM_BLK_CONN(iid)
             num_col = self.num_nodes_per_elem(block_id)
             lid_to_gid = self.get_mapping(ex.maps.node_local_to_global, contiguous=True)
@@ -434,6 +454,28 @@ class parallel_exodusii_file(exodusii_file):
                 gid = map1[(fid, block_id, iid)]
                 idx = map2[(block_id, gid)] - 1
                 conn[idx] = [lid_to_gid[(fid, lid)] for lid in lids]
+        return conn
+
+    def _element_node_conn(self, block_id, num_row):
+        """Nodal connectivity of a joined block (1-based contiguous node ids)."""
+        num_col = self.num_nodes_per_elem(block_id)
+        if num_col is None:
+            return None
+        node_index, _ = self._node_index()
+        conn = np.zeros((int(num_row), int(num_col)), dtype=int)
+        for (fid, file) in enumerate(self.files):
+            rows = self._file_block_rows(fid).get(int(block_id))
+            if rows is None:
+                continue
+            block_iid = rows[0]
+            local = self.get_variable(file, ex.VAR_ELEM_BLK_CONN(block_iid))
+            if local is None:
+                return None
+            local = np.asarray(local, dtype=np.int64)
+            if local.ndim != 2 or local.shape[1] != num_col:
+                return None
+            cols = self._block_columns(fid, block_id)
+            conn[cols] = node_index[fid][local - 1] + 1
         return conn
 
     def f_get_element_id_map(self, file):
@@ -545,32 +587,37 @@ class parallel_exodusii_file(exodusii_file):
         # A single time step is read by slicing each file's variable.
         if time_step is None:
             index = slice(None)
-            shape = (self.num_times(), self.num_elems_in_blk(block_id))
         else:
             index = _time_step_index(time_step, self.num_times())
-            shape = (self.num_elems_in_blk(block_id),)
-        values = np.zeros(shape, dtype=float)
+        return self.element_variable_values_by_index(block_id, var_iid, index)
 
-        map1 = self.get_mapping(ex.maps.elem_block_elem_local_to_global)
-        map2 = self.get_mapping(ex.maps.elem_block_elem_global_to_local)
+    def element_variable_values_by_index(self, block_id, var_iid, index):
+        """Values of the ``var_iid``-th (1-based) element variable on a block.
+
+        ``index`` selects the time steps: a 0-based step or ``slice(None)``
+        for all. Returns None when the variable is not stored on the block
+        (truth table).
+        """
+        n_elem = int(self.num_elems_in_blk(block_id))
+        if isinstance(index, slice):
+            shape = (self.num_times(), n_elem)
+        else:
+            shape = (n_elem,)
+        values = np.zeros(shape, dtype=float)
         active = found = 0
         for (fid, file) in enumerate(self.files):
-            block_iid = self.f_get_element_block_iid(file, block_id)
-            if not self.elem_block_is_active(file, block_iid):
+            rows = self._file_block_rows(fid).get(int(block_id))
+            if rows is None:
                 continue
             active += 1
             local_vals = self.get_variable(
-                file, ex.VAR_ELEM_VAR(var_iid, block_iid), index=index
+                file, ex.VAR_ELEM_VAR(var_iid, rows[0]), index=index
             )
             if local_vals is None:
                 # Not defined on this block (element variable truth table).
                 continue
             found += 1
-            cols = np.zeros(local_vals.shape[-1], dtype=int)
-            for iid in range(len(cols)):
-                gid = map1[(fid, block_id, iid + 1)]
-                cols[iid] = map2[(block_id, gid)] - 1
-            values[..., cols] = local_vals
+            values[..., self._block_columns(fid, block_id)] = local_vals
         if active and not found:
             return None
         return values
@@ -866,16 +913,18 @@ class parallel_exodusii_file(exodusii_file):
         if not num_nodes_in_ns:
             return None
 
-        ns_nodes = []
-        node_map = self.get_mapping(ex.maps.node_local_to_global)
+        ns_nodes = [np.zeros(0, dtype=int)]
         for (fid, file) in enumerate(self.files):
             set_iid = self.f_get_node_set_iid(file, set_id)
             if not self.node_set_is_active(file, set_iid):
                 continue
             lids = self.get_variable(file, ex.VAR_NODE_NODE_SET(set_iid))
-            ns_nodes.extend([node_map[(fid, lid)] for lid in lids])
+            if lids is None:
+                continue
+            lids = np.asarray(lids, dtype=np.int64).reshape(-1)
+            ns_nodes.append(self._node_gids(fid)[lids - 1])
 
-        ns_nodes = np.array(sorted(set(ns_nodes)), dtype=int)
+        ns_nodes = np.unique(np.concatenate(ns_nodes)).astype(int)
         cache[set_id] = ns_nodes
 
         return ns_nodes
@@ -920,18 +969,27 @@ class parallel_exodusii_file(exodusii_file):
         # A single time step is read by slicing each file's variable.
         if time_step is None:
             index = slice(None)
-            shape = (self.num_times(), self.num_nodes())
         else:
             index = _time_step_index(time_step, self.num_times())
+        return self.node_variable_values_by_index(var_iid, index)
+
+    def node_variable_values_by_index(self, var_iid, index):
+        """Values of the ``var_iid``-th (1-based) nodal variable.
+
+        ``index`` selects the time steps: a 0-based step or ``slice(None)``
+        for all.
+        """
+        if isinstance(index, slice):
+            shape = (self.num_times(), self.num_nodes())
+        else:
             shape = (self.num_nodes(),)
         values = np.zeros(shape, dtype=float)
-        node_map = self.get_mapping(ex.maps.node_local_to_global, contiguous=True)
+        node_index, _ = self._node_index()
         for (fid, file) in enumerate(self.files):
-            num_nodes = self.get_dimension(file, ex.DIM_NUM_NODES)
-            cols = [node_map[(fid, lid)] - 1 for lid in range(1, num_nodes + 1)]
-            values[..., cols] = self.get_variable(
-                file, ex.VAR_NODE_VAR(var_iid), index=index
-            )
+            local = self.get_variable(file, ex.VAR_NODE_VAR(var_iid), index=index)
+            if local is None:
+                continue
+            values[..., node_index[fid]] = local
         return values
 
     def get_qa_records(self):
@@ -977,19 +1035,32 @@ class parallel_exodusii_file(exodusii_file):
         # Elements are reported as 1-based indices into the joined element
         # order (see joined_elem_ids), like a serial file's element indices.
         side = 0
-        lid_to_gid = self.get_mapping(ex.maps.elem_local_to_global)
-        gid_to_index = self._joined_elem_index()
+        joined = self.joined_elem_ids()
+        order = np.argsort(joined, kind="stable")
+        sorted_ids = joined[order]
         for (fid, file) in enumerate(self.files):
             set_iid = self.get_side_set_iid(file, set_id)
             if not self.side_set_is_active(file, set_iid):
                 continue
             file_local_ss_elems = self.get_variable(file, ex.VAR_ELEM_SIDE_SET(set_iid))
             file_local_ss_sides = self.get_variable(file, ex.VAR_SIDE_SIDE_SET(set_iid))
-            for (i, local_elem) in enumerate(file_local_ss_elems):
-                elems[side] = gid_to_index[int(lid_to_gid[(fid, local_elem)])]
-                sides[side] = file_local_ss_sides[i]
-                side += 1
+            if file_local_ss_elems is None:
+                continue
+            local = np.asarray(file_local_ss_elems, dtype=np.int64).reshape(-1)
+            gids = self._elem_gids(fid)[local - 1]
+            pos = np.searchsorted(sorted_ids, gids)
+            pos = np.minimum(pos, sorted_ids.size - 1)
+            if sorted_ids.size == 0 or np.any(sorted_ids[pos] != gids):
+                raise ValueError(
+                    f"Side set {set_id}: {self.get_filename(file)} references "
+                    "elements that are in no element block"
+                )
+            n = local.size
+            elems[side: side + n] = order[pos] + 1
+            sides[side: side + n] = np.asarray(file_local_ss_sides).reshape(-1)
+            side += n
 
+        cache[set_id] = (elems, sides)
         return elems, sides
 
     def get_side_set_elems(self, set_id):
@@ -1545,46 +1616,148 @@ class parallel_exodusii_file(exodusii_file):
                 start = end
         return mapping
 
-    def _joined_block_gids(self):
-        """Return {element block ID: sorted global element IDs of the block}.
+    # ------------------------------------------------------------------ #
+    # Array-based local -> global maps (vectorized and cached). The dict
+    # based get_mapping() API above is kept for compatibility; the readers
+    # use these instead (no per-node / per-element Python loops).
+    # ------------------------------------------------------------------ #
+    def _node_gids(self, fid):
+        """Global node ids (``node_num_map``) of file ``fid``, int64."""
+        key = ("node_gids", fid)
+        if key not in self.cache:
+            file = self.files[fid]
+            gids = self.get_variable(file, ex.VAR_NODE_NUM_MAP)
+            if gids is None:
+                raise ValueError(
+                    f"{self.get_filename(file)} has no node_num_map: cannot join "
+                    "the parts of a parallel decomposition"
+                )
+            self.cache[key] = np.asarray(gids, dtype=np.int64).reshape(-1)
+        return self.cache[key]
+
+    def _elem_gids(self, fid):
+        """Global element ids (``elem_num_map``) of file ``fid``, int64."""
+        key = ("elem_gids", fid)
+        if key not in self.cache:
+            gids = self.f_get_element_id_map(self.files[fid])
+            self.cache[key] = np.asarray(gids, dtype=np.int64).reshape(-1)
+        return self.cache[key]
+
+    def _node_index(self):
+        """``(index, gids)``: per file, the 0-based joined index of each local
+        node; and the sorted unique global node ids (joined node order)."""
+        if "node_index" not in self.cache:
+            parts = [self._node_gids(fid) for fid in range(len(self.files))]
+            gids, inverse = _unique_ids(np.concatenate(parts), return_inverse=True)
+            bounds = np.cumsum([0] + [p.size for p in parts])
+            index = [
+                inverse[bounds[i]: bounds[i + 1]].reshape(-1)
+                for i in range(len(parts))
+            ]
+            self.cache["node_index"] = (index, gids)
+        return self.cache["node_index"]
+
+    def global_node_index(self, gids):
+        """0-based joined (contiguous) node index of global node ids ``gids``."""
+        _, uniq = self._node_index()
+        gids = np.asarray(gids, dtype=np.int64).reshape(-1)
+        pos = np.searchsorted(uniq, gids)
+        pos = np.minimum(pos, max(uniq.size - 1, 0))
+        if gids.size and (uniq.size == 0 or np.any(uniq[pos] != gids)):
+            raise ValueError("global node id(s) not found in any part")
+        return pos
+
+    def _file_block_rows(self, fid):
+        """{block id: (block iid, start, stop)} of the active element blocks of
+        file ``fid``: their elements are rows ``start:stop`` of the file's
+        element order (and of its elem_num_map)."""
+        key = ("block_rows", fid)
+        if key not in self.cache:
+            file = self.files[fid]
+            ids = self.get_variable(file, ex.VAR_ID_ELEM_BLK)
+            ids = [] if ids is None else [int(i) for i in np.atleast_1d(ids)]
+            status = self.get_variable(file, ex.VAR_STAT_ELEM_BLK)
+            status = np.ones(len(ids), dtype=int) if status is None else status
+            rows, start = {}, 0
+            for (iid, block_id) in enumerate(ids, start=1):
+                if not status[iid - 1]:
+                    continue
+                n = self.get_dimension(
+                    file, ex.DIM_NUM_ELEM_IN_ELEM_BLK(iid), default=0
+                )
+                rows[block_id] = (iid, start, start + int(n or 0))
+                start += int(n or 0)
+            self.cache[key] = rows
+        return self.cache[key]
+
+    def _block_local_gids(self, fid, block_id):
+        rows = self._file_block_rows(fid).get(int(block_id))
+        if rows is None:
+            return np.zeros(0, dtype=np.int64)
+        return self._elem_gids(fid)[rows[1]: rows[2]]
+
+    def _joined_block_gid_arrays(self):
+        """{element block ID: sorted global element ids of the block (array)}.
 
         The joined element order lists the blocks in order and, within a
         block, its elements by increasing global id. Global ids need not be
         contiguous per block (or at all), e.g. after adaptive refinement.
         """
-        if "joined_block_gids" in self.cache:
-            return self.cache["joined_block_gids"]
-        found = {}
-        l2g = self.get_mapping(ex.maps.elem_block_elem_local_to_global)
-        for (fid, block_id, iid), gid in l2g.items():
-            found.setdefault(int(block_id), set()).add(int(gid))
+        if "joined_block_gid_arrays" in self.cache:
+            return self.cache["joined_block_gid_arrays"]
         counts = self.num_elems_in_all_blks()
         gids = {}
         for (i, block_id) in enumerate(self.get_element_block_ids()):
-            block_gids = sorted(found.get(int(block_id), ()))
-            if counts is not None and len(block_gids) != int(counts[i]):
+            block_id = int(block_id)
+            parts = [np.zeros(0, dtype=np.int64)] + [
+                self._block_local_gids(fid, block_id)
+                for fid in range(len(self.files))
+            ]
+            block_gids = _unique_ids(np.concatenate(parts))
+            if counts is not None and block_gids.size != int(counts[i]):
                 raise ValueError(
                     f"Element block {block_id}: the decomposition has "
-                    f"{len(block_gids)} distinct global element ids, but the "
+                    f"{block_gids.size} distinct global element ids, but the "
                     f"global block size is {int(counts[i])}"
                 )
-            gids[int(block_id)] = block_gids
-        all_gids = [gid for block_gids in gids.values() for gid in block_gids]
-        if len(set(all_gids)) != len(all_gids):
+            gids[block_id] = block_gids
+        all_gids = np.concatenate([np.zeros(0, np.int64)] + list(gids.values()))
+        if _unique_ids(all_gids).size != all_gids.size:
             raise ValueError(
                 "The decomposition uses the same global element id in more "
                 "than one element block"
             )
-        self.cache["joined_block_gids"] = gids
+        self.cache["joined_block_gid_arrays"] = gids
         return gids
+
+    def _block_columns(self, fid, block_id):
+        """0-based position in the joined block of each element of a block in
+        file ``fid`` (file order)."""
+        key = ("block_columns", fid, int(block_id))
+        if key not in self.cache:
+            joined = self._joined_block_gid_arrays()[int(block_id)]
+            local = self._block_local_gids(fid, block_id)
+            self.cache[key] = np.searchsorted(joined, local)
+        return self.cache[key]
+
+    def _joined_block_gids(self):
+        """Return {element block ID: sorted global element IDs of the block}
+        (lists; see :meth:`_joined_block_gid_arrays`)."""
+        return {
+            block_id: gids.tolist()
+            for block_id, gids in self._joined_block_gid_arrays().items()
+        }
 
     def joined_elem_ids(self):
         """Global element ids in the joined element order (see
-        :meth:`_joined_block_gids`); entry ``i`` is the id of joined element
-        ``i + 1``."""
-        gids = self._joined_block_gids()
-        ids = [gid for block_id in gids for gid in gids[block_id]]
-        return np.array(ids, dtype=int)
+        :meth:`_joined_block_gid_arrays`); entry ``i`` is the id of joined
+        element ``i + 1``."""
+        if "joined_elem_ids" not in self.cache:
+            gids = self._joined_block_gid_arrays()
+            self.cache["joined_elem_ids"] = np.concatenate(
+                [np.zeros(0, dtype=np.int64)] + list(gids.values())
+            ).astype(int)
+        return self.cache["joined_elem_ids"].copy()
 
     def _joined_elem_index(self):
         """Return {global element ID: 1-based index in the joined order}."""
@@ -1723,22 +1896,66 @@ class parallel_exodusii_file(exodusii_file):
             if ex_init != ex_init_params(fh):
                 raise TypeError("initialization parameters not consistent across files")
 
-        nblks = self.get_dimension(files[0], ex.DIM_NUM_ELEM_BLK_GLOBAL, default=1)
         for file in files:
             counted = 0
             elem_num_map = self.f_get_element_id_map(file)
+            ids = self.get_variable(file, ex.VAR_ID_ELEM_BLK)
+            nblks = 0 if ids is None else np.atleast_1d(ids).size
             for block_iid in range(1, nblks + 1):
                 if not self.elem_block_is_active(file, block_iid):
                     continue
-                conn = self.get_variable(file, ex.VAR_ELEM_BLK_CONN(block_iid))
-                counted += len(conn)
+                counted += int(
+                    self.get_dimension(
+                        file, ex.DIM_NUM_ELEM_IN_ELEM_BLK(block_iid), default=0
+                    )
+                    or 0
+                )
             if counted != len(elem_num_map):
                 raise ValueError(
                     f"Expected {len(elem_num_map)} elements across all blocks in "
                     f"{self.get_filename(file)}, counted {counted}"
                 )
 
+        self._check_complete(files)
         return
+
+    def _check_complete(self, files):
+        """Raise ValueError unless ``files`` are all parts of a decomposition.
+
+        A missing part would otherwise read as zero-filled nodes, shifted node
+        numbering and truncated sets.
+        """
+        names = [self.get_filename(f) for f in files]
+        distinct = {os.path.realpath(n) for n in names}
+        if len(distinct) != len(names):
+            raise ValueError(f"The same part was given more than once: {names}")
+        n_procs = self.get_dimension(files[0], "num_processors", default=None)
+        per_file = self.get_dimension(files[0], "num_procs_file", default=1) or 1
+        if n_procs:
+            expected = -(-int(n_procs) // int(per_file))
+            if len(files) != expected:
+                raise ValueError(
+                    f"Incomplete parallel decomposition: it has {int(n_procs)} "
+                    f"part(s) (num_processors) but {len(files)} file(s) were "
+                    f"given: {names}"
+                )
+        for what, map_name, dim in (
+            ("node", ex.VAR_NODE_NUM_MAP, ex.DIM_NUM_NODE_GLOBAL),
+            ("element", ex.VAR_ELEM_NUM_MAP, ex.DIM_NUM_ELEM_GLOBAL),
+        ):
+            total = self.get_dimension(files[0], dim, default=None)
+            maps = [self.get_variable(f, map_name) for f in files]
+            if total is None or any(m is None for m in maps):
+                continue
+            found = _unique_ids(np.concatenate(
+                [np.asarray(m, dtype=np.int64).reshape(-1) for m in maps]
+            )).size
+            if found != int(total):
+                raise ValueError(
+                    f"Incomplete parallel decomposition: the {len(files)} "
+                    f"file(s) hold {found} distinct global {what} ids, but the "
+                    f"model has {int(total)} ({dim}); files: {names}"
+                )
 
     def _get_element_info(self, elem_id):
         """Get the element block ID and element index within the block for elem_id

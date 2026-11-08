@@ -352,7 +352,9 @@ def _vector_model():
         "taken_Y": rng.random((n_steps, n_nodes)),
         "num_0": rng.random((n_steps, n_nodes)),  # 2 components use _X/_Y
         "num_1": rng.random((n_steps, n_nodes)),
-        "mixed_X": rng.random((n_steps, n_nodes)),  # not one convention
+        # letters and digits are separate conventions: mixed_X/_Y form a
+        # 2-vector, mixed_0 stays a scalar
+        "mixed_X": rng.random((n_steps, n_nodes)),
         "mixed_Y": rng.random((n_steps, n_nodes)),
         "mixed_0": rng.random((n_steps, n_nodes)),
         "T": rng.random((n_steps, n_nodes)),
@@ -381,11 +383,13 @@ def test_combine_components(tmp_path):
         for suffix in exovista._model.component_suffixes(values.shape[2]):
             assert name + suffix not in pd
     scalars = ["partial_X", "partial_Z", "taken", "taken_X", "taken_Y", "num_0",
-               "num_1", "mixed_X", "mixed_Y", "mixed_0", "T"]
+               "num_1", "mixed_0", "T"]
     for name in scalars:
         assert pd[name].shape == (8,), name
         np.testing.assert_array_equal(pd[name], model.node_vars[name][0])
-    assert sorted(pd.keys()) == sorted(list(arrays) + scalars)
+    np.testing.assert_array_equal(
+        pd["mixed"], np.c_[model.node_vars["mixed_X"][0], model.node_vars["mixed_Y"][0]])
+    assert sorted(pd.keys()) == sorted(list(arrays) + scalars + ["mixed"])
     # combined arrays sit where their first component was
     assert list(pd.keys())[:5] == ["vel", "uv", "sym", "four", "five"]
 

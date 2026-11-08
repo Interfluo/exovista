@@ -436,8 +436,10 @@ def test_non_ascii_names_roundtrip(tmp_path):
     assert back.info == [("ïnfo " * 30).encode()[:80].decode("utf-8", "ignore")]
 
     with netCDF4.Dataset(path) as ds:
-        raw = np.ma.getdata(ds["eb_names"][0]).tobytes().rstrip()
-        assert raw == names["block"].encode("utf-8")
+        raw = np.ma.getdata(ds["eb_names"][0]).tobytes()
+        # NUL padded, like the Exodus C library (not blank padded)
+        assert raw.rstrip(b"\0") == names["block"].encode("utf-8")
+        assert set(raw[len(names["block"].encode("utf-8")):]) == {0}
         # readers size their name buffers from this attribute: bytes
         assert ds.maximum_name_length == len(names["block"].encode("utf-8")) == 47
 

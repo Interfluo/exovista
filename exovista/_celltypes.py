@@ -4,7 +4,8 @@ This module knows, for every element type exovista supports:
 
 * its canonical Exodus element-type name (e.g. ``"HEX20"``) and the name
   written to disk (the same, except ``TETRA``, ``WEDGE`` and ``PYRAMID`` for
-  the linear tetrahedron, wedge and pyramid; see :attr:`ExoType.written_name`);
+  the linear tetrahedron, wedge and pyramid and ``TRI3``/``TRI6`` for the
+  triangular shells; see :attr:`ExoType.written_name`);
 * the Exodus names accepted when reading (case-insensitive; e.g. ``HEX``,
   ``HEX8``, ``HEXAHEDRON``; the node count decides the order, as in Exodus);
 * the VTK cell type produced on read;
@@ -34,9 +35,11 @@ shell-like sides (two faces then three edges) and a ``TRISHELL`` element in a
 2D file is a plain triangle (three edge sides).
 
 Element-type names are recognised, as by the Exodus library and VTK's reader,
-by their first three letters (``HEXA8`` is a ``HEX8``, ``TRIA3`` a ``TRI3``,
-``EDGE2`` -- the libMesh/MOOSE name -- a ``BAR2``); the node count stored in
-the file decides the element order.
+by the first three letters of their leading alphabetic part (``HEXA8`` is a
+``HEX8``, ``TRIA3`` a ``TRI3``, ``EDGE2`` -- the libMesh/MOOSE name -- a
+``BAR2``, and ``HEX_8``, ``HEX-8``, ``Hex 8`` or ``HEX8S`` are hexahedra);
+whatever follows is ignored and the node count stored in the file decides the
+element order.
 """
 
 from __future__ import annotations
@@ -144,10 +147,12 @@ class ExoType:
         """Element-type name exovista writes to disk for this type.
 
         :attr:`name`, except ``TETRA``, ``WEDGE`` and ``PYRAMID`` for
-        ``TETRA4``, ``WEDGE6`` and ``PYRAMID5``. Every Exodus reader (the
-        Exodus library, VTK, SEACAS/IOSS, libMesh) identifies a type by its
-        first three letters plus the node count, so both spellings are the
-        same element; meshio (<= 5.3) reads only the short ones.
+        ``TETRA4``, ``WEDGE6`` and ``PYRAMID5`` and ``TRI3``/``TRI6`` for
+        ``TRISHELL3``/``TRISHELL6``. Every Exodus reader (the Exodus
+        library, VTK, SEACAS/IOSS, libMesh) identifies a type by its first
+        three letters plus the node count, so both spellings are the same
+        element (a ``TRI`` in a 3D file is a triangular shell, with two faces
+        and three edges as sides); meshio (<= 5.3) reads only the short ones.
         """
         return _WRITTEN_NAMES.get(self.name, self.name)
 
@@ -188,9 +193,17 @@ _BEAM_SIDES = ((0, 1), (1, 0))
 
 # Names written to disk where they differ from the canonical name: meshio
 # (<= 5.3) cannot read TETRA4 (it maps it to an unknown "tetra4" cell type),
-# WEDGE6 or PYRAMID5, but reads TETRA, WEDGE and PYRAMID, which every Exodus
-# reader resolves to the same elements (first three letters + node count).
-_WRITTEN_NAMES = {"TETRA4": "TETRA", "WEDGE6": "WEDGE", "PYRAMID5": "PYRAMID"}
+# WEDGE6, PYRAMID5, TRISHELL3 or TRISHELL6, but reads TETRA, WEDGE, PYRAMID,
+# TRI3 and TRI6, which every Exodus reader resolves to the same elements
+# (first three letters + node count; TRISHELL* only occur in 3D files, where
+# the Exodus library and VTK read TRI* as triangular shells).
+_WRITTEN_NAMES = {
+    "TETRA4": "TETRA",
+    "WEDGE6": "WEDGE",
+    "PYRAMID5": "PYRAMID",
+    "TRISHELL3": "TRI3",
+    "TRISHELL6": "TRI6",
+}
 
 # Exodus -> VTK node permutations for the types whose node order differs.
 # HEX20: Exodus puts the vertical (1-5, 2-6, 3-7, 4-8) mid-edge nodes before
@@ -352,7 +365,9 @@ _VTK_TO_EXO: dict[int, _VtkMapping] = {
 #: VTK cell types exovista can write.
 SUPPORTED_VTK_TYPES: frozenset[int] = frozenset(_VTK_TO_EXO)
 
-_NAME_RE = re.compile(r"^([A-Z]+?)(\d*)$")
+# Leading alphabetic part of an element-type name, and the first digit run.
+_LETTERS_RE = re.compile(r"[A-Z]+")
+_DIGITS_RE = re.compile(r"\d+")
 
 
 def vtk_type_name(vtk_type: int) -> str:
@@ -428,13 +443,14 @@ def resolve_exo_type(
         Element type as stored in the file (``elem_type`` attribute). The match
         is case-insensitive and ignores surrounding whitespace. As in the
         Exodus library and VTK, the family is decided by the first three
-        letters, so any alias works (``HEX``, ``HEX8``, ``HEXA8``,
-        ``HEXAHEDRON``, ``TRIA3``, ``EDGE2``, ``BEAM2``, ...); ``STRAIGHT`` is
-        a ``BAR``.
+        letters of the leading alphabetic part and the rest of the name is
+        ignored, so any alias works (``HEX``, ``HEX8``, ``HEXA8``,
+        ``HEXAHEDRON``, ``HEX_8``, ``HEX8S``, ``TRIA3``, ``EDGE2``, ``BEAM2``,
+        ...); ``STRAIGHT`` is a ``BAR``.
     n_nodes : int, optional
         Nodes per element in the block. As in Exodus, it decides the element
-        order (``HEX`` with 20 nodes is ``HEX20``). Defaults to the number in
-        the name, else the linear element.
+        order (``HEX`` with 20 nodes is ``HEX20``). Defaults to the first
+        number in the name, else the linear element.
     num_dim : int, optional
         Spatial dimension of the file. As in the Exodus library, a ``TRI``
         element in a 3D file is treated as a ``TRISHELL`` (shell-like sides)
@@ -446,11 +462,11 @@ def resolve_exo_type(
         ``None`` if the type is unknown or the node count is not supported.
     """
     key = str(exo_name).strip().upper()
-    match = _NAME_RE.match(key)
+    match = _LETTERS_RE.match(key)
     if match is None:
         return None
-    prefix, digits = match.groups()
-    family = _family(prefix)
+    family = _family(match.group())
+    digits = _DIGITS_RE.search(key, match.end())
     if family is None:
         return None
     if num_dim is not None:
@@ -460,7 +476,7 @@ def resolve_exo_type(
             family = "TRI"
     by_nodes = _BY_FAMILY[family]
     if n_nodes is None:
-        n_nodes = int(digits) if digits else min(by_nodes)
+        n_nodes = int(digits.group()) if digits else min(by_nodes)
     return by_nodes.get(int(n_nodes))
 
 

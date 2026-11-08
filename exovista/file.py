@@ -94,11 +94,13 @@ MAX_NAME_LENGTH = 256
 
 
 def _char_row(text, length):
-    """``text`` as a blank-padded netCDF char (``S1``) row of ``length`` bytes.
+    """``text`` as a NUL-padded netCDF char (``S1``) row of ``length`` bytes.
 
     Exodus stores names as raw bytes; they are UTF-8 encoded here (and decoded
-    as UTF-8 on read). Raises ValueError if the encoded text is longer than
-    ``length`` bytes.
+    as UTF-8 on read). Like the Exodus C library (and the netCDF fill value),
+    the unused bytes are NULs, so readers that do not strip trailing blanks
+    (meshio, raw netCDF) get the plain name. Raises ValueError if the encoded
+    text is longer than ``length`` bytes.
     """
     data = str(text).encode("utf-8")
     if len(data) > length:
@@ -106,7 +108,12 @@ def _char_row(text, length):
             f"{str(text)[:40]!r}... is {len(data)} bytes long (UTF-8); at most "
             f"{length} fit"
         )
-    return np.frombuffer(data.ljust(length, b" "), dtype="S1")
+    return np.frombuffer(data.ljust(length, b"\0"), dtype="S1")
+
+
+def _empty_name():
+    """An unnamed entry: a ``len_name`` row of NULs."""
+    return np.zeros(MAX_NAME_LENGTH, dtype="S1")
 
 
 def _truncate_utf8(text, n_bytes):
@@ -141,6 +148,12 @@ class exodusii_file:
         Deflate level 0-9 for array variables written in mode 'w' (0 disables
         compression). Defaults to the ``EXODUSII_COMPRESSION_LEVEL``
         environment setting (1).
+    num_time_steps : int, optional
+        Mode 'w' only: give the ``time_step`` dimension this fixed length
+        instead of making it unlimited. Reading a netCDF-4 file whose time
+        dimension is unlimited costs a scan over every variable per variable
+        read; with a fixed length that cost disappears, but no further time
+        steps can be appended to the file.
 
     Notes
     -----
@@ -165,7 +178,12 @@ class exodusii_file:
     """  # noqa: E501
 
     def __init__(
-        self, filename, mode="r", float_word_size=None, compression_level=None
+        self,
+        filename,
+        mode="r",
+        float_word_size=None,
+        compression_level=None,
+        num_time_steps=None,
     ):
         if mode not in ("r", "a", "w"):
             raise ValueError(f"Invalid Exodus file mode {mode!r}")
@@ -181,6 +199,9 @@ class exodusii_file:
             )
         self.float_word_size = int(float_word_size)
         self.compression_level = int(compression_level)
+        if num_time_steps is not None and int(num_time_steps) < 0:
+            raise ValueError(f"num_time_steps must be >= 0, got {num_time_steps!r}")
+        self.num_time_steps = None if not num_time_steps else int(num_time_steps)
         self.mode = mode
         self.filename = filename
         if self.mode == "r":
@@ -1604,10 +1625,24 @@ class exodusii_file:
         if time_step is None:
             index = slice(None)
         else:
-            index = _time_step_index(time_step, var.shape[0])
+            index = _time_step_index(time_step, self._num_steps_of(var))
         if column is not None:
             index = (index, column)
         return self.get_variable(name, index=index)
+
+    def _num_steps_of(self, var):
+        """Length of the time axis of ``var``.
+
+        In read mode the number of time steps cannot change, so it is looked
+        up once: asking a netCDF-4 variable for the length of an unlimited
+        dimension scans every variable of the file.
+        """
+        if self.mode != "r":
+            return var.shape[0]
+        n = getattr(self, "_num_steps_read", None)
+        if n is None:
+            n = self._num_steps_read = int(var.shape[0])
+        return n
 
     def get_element_variable_values_across_blocks(self, var_name, time_step=None):
         values = []
@@ -2722,7 +2757,7 @@ class exodusii_file:
         return _select_time_step(values, time_step)
 
     def _pad_name(self, name):
-        """``name`` as a UTF-8, blank-padded ``len_name`` char row.
+        """``name`` as a UTF-8, NUL-padded ``len_name`` char row.
 
         Also raises the ``maximum_name_length`` attribute (in bytes, which is
         what readers allocate) when needed.
@@ -2746,7 +2781,7 @@ class exodusii_file:
         self.setattr(ex.ATT_FLT_WORDSIZE, self.float_word_size)
         self.setattr(ex.ATT_FILESIZE, 1)
 
-        self.create_dimension(ex.DIM_TIME, None)
+        self.create_dimension(ex.DIM_TIME, getattr(self, "num_time_steps", None))
         self.create_variable(ex.VAR_WHOLE_TIME, float, (ex.DIM_TIME,))
 
         # standard ExodusII dimensioning
@@ -3221,7 +3256,7 @@ class exodusii_file:
 
             var = ex.VAR_NAME_EDGE_BLK_ATTRIB(block_iid)
             self.create_variable(var, str, (dims[1], ex.DIM_NAME))
-            self.fill_variable(var, " " * MAX_NAME_LENGTH)
+            self.fill_variable(var, _empty_name())
 
         self._counter[counter] += 1
 
@@ -3495,7 +3530,7 @@ class exodusii_file:
             var = ex.VAR_NAME_ELEM_BLK_ATTRIB(block_iid)
             self.create_variable(var, str, (dim, ex.DIM_NAME))
             for i in range(num_attr):
-                self.fill_variable(var, i, " " * MAX_NAME_LENGTH)
+                self.fill_variable(var, i, _empty_name())
 
         self._counter[counter] += 1
 
@@ -3786,7 +3821,7 @@ class exodusii_file:
 
             var = ex.VAR_NAME_FACE_BLK_ATTRIB(block_iid)
             self.create_variable(var, str, (dims[1], ex.DIM_NAME))
-            self.fill_variable(var, " " * MAX_NAME_LENGTH)
+            self.fill_variable(var, _empty_name())
 
         self._counter[counter] += 1
 
@@ -4673,7 +4708,7 @@ class exodusii_file:
         self.create_variable(ex.VAR_STAT_EDGE_BLK, int, (ex.DIM_NUM_EDGE_BLK,))
         self.fill_variable(ex.VAR_STAT_EDGE_BLK, status)
 
-        names = np.array([" " * MAX_NAME_LENGTH for _ in prop1])
+        names = [_empty_name() for _ in prop1]
         self.create_variable(
             ex.VAR_NAME_EDGE_BLK, str, (ex.DIM_NUM_EDGE_BLK, ex.DIM_NAME)
         )
@@ -4698,7 +4733,7 @@ class exodusii_file:
         self.create_variable(ex.VAR_STAT_ELEM_BLK, int, (ex.DIM_NUM_ELEM_BLK,))
         self.fill_variable(ex.VAR_STAT_ELEM_BLK, status)
 
-        names = np.array([" " * MAX_NAME_LENGTH for _ in prop1])
+        names = [_empty_name() for _ in prop1]
         self.create_variable(
             ex.VAR_NAME_ELEM_BLK, str, (ex.DIM_NUM_ELEM_BLK, ex.DIM_NAME)
         )
@@ -4723,7 +4758,7 @@ class exodusii_file:
         self.create_variable(ex.VAR_STAT_FACE_BLK, int, (ex.DIM_NUM_FACE_BLK,))
         self.fill_variable(ex.VAR_STAT_FACE_BLK, status)
 
-        names = np.array([" " * MAX_NAME_LENGTH for _ in prop1])
+        names = [_empty_name() for _ in prop1]
         self.create_variable(
             ex.VAR_NAME_FACE_BLK, str, (ex.DIM_NUM_FACE_BLK, ex.DIM_NAME)
         )
@@ -4748,7 +4783,7 @@ class exodusii_file:
         self.create_variable(ex.VAR_NODE_SET_STAT, int, (ex.DIM_NUM_NODE_SET,))
         self.fill_variable(ex.VAR_NODE_SET_STAT, status)
 
-        names = np.array([" " * MAX_NAME_LENGTH for _ in prop1])
+        names = [_empty_name() for _ in prop1]
         self.create_variable(
             ex.VAR_NAME_NODE_SET, str, (ex.DIM_NUM_NODE_SET, ex.DIM_NAME)
         )
@@ -4773,7 +4808,7 @@ class exodusii_file:
         self.create_variable(ex.VAR_SIDE_SET_STAT, int, (ex.DIM_NUM_SIDE_SET,))
         self.fill_variable(ex.VAR_SIDE_SET_STAT, status)
 
-        names = np.array([" " * MAX_NAME_LENGTH for _ in prop1])
+        names = [_empty_name() for _ in prop1]
         self.create_variable(
             ex.VAR_NAME_SIDE_SET, str, (ex.DIM_NUM_SIDE_SET, ex.DIM_NAME)
         )

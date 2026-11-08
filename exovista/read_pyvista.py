@@ -35,7 +35,7 @@ from vtkmodules.vtkCommonCore import vtkStringArray
 
 from ._backend import ExodusReader, open_reader
 from ._celltypes import ExoType, resolve_exo_type
-from ._model import component_suffixes
+from ._model import component_groups
 
 __all__ = [
     "read_exo",
@@ -52,11 +52,6 @@ _RESERVED_FIELD_DATA = ("times", "time", "num_dim")
 
 # netCDF's default fill value for floats: a time value that was never written.
 _NETCDF_FLOAT_FILL = 9.969209968386869e36
-
-# Letter suffixes of multi-component variables (see _model.component_suffixes).
-_LETTER_SUFFIXES = frozenset(
-    s[1:] for n in (2, 3, 6, 9) for s in component_suffixes(n)
-)
 
 
 # --------------------------------------------------------------------------- #
@@ -105,6 +100,10 @@ def read_exo(
         _XZ``; full tensors ``_XX, _XY, ... _ZZ``; otherwise ``_0 .. _{n-1}``)
         into one multi-component array, but only when all components of the
         array are present and the combined name is not itself a variable.
+        Letter and digit suffixes are grouped separately and the largest
+        complete set wins, so another variable that merely shares the base
+        name (``V_0`` next to ``V_X, V_Y, V_Z``) stays a scalar (see
+        :func:`exovista._model.component_groups`).
     original_order : bool, default: True
         If the element id map is a permutation of ``1..num_elem`` (as written
         by :func:`exovista.write_exo`), return the cells sorted by element id,
@@ -360,8 +359,18 @@ def read_global_fields(filename, *files, names=None):
 # Element blocks and cell order
 # --------------------------------------------------------------------------- #
 def _is_legacy_1x(r: ExodusReader) -> bool:
-    """True for a file written by exovista 1.x (always float32, fixed title)."""
-    return r.title == "pyvista_mesh" and r.float_word_size == 4
+    """True for a file written by exovista 1.x.
+
+    1.x always wrote float32 data, the title ``pyvista_mesh`` and no element
+    id map; exovista 2.0 always writes the map, so a 2.0 file with that title
+    and ``precision="single"`` is not mistaken for a 1.x file.
+    """
+    return (
+        r.title == "pyvista_mesh"
+        and r.float_word_size == 4
+        and not r.is_parallel
+        and r.elem_id_map() is None
+    )
 
 
 class _Layout:
@@ -396,8 +405,9 @@ class _Layout:
             self.side_types.append(self._side_type(block, info))
         if skipped:
             details = ", ".join(
-                f"{b.id} ({b.elem_type!r}, {b.n_nodes_per_elem} nodes, "
-                f"{b.n_elem} elements)"
+                f"{b.id} ({b.elem_type!r}, "
+                + (f"{b.n_nodes_per_elem} nodes, " if b.n_nodes_per_elem else "")
+                + f"{b.n_elem} elements)"
                 for b in skipped
             )
             warnings.warn(
@@ -786,40 +796,11 @@ def _history(values, shape) -> np.ndarray:
     return values.reshape(shape)
 
 
-def _component_groups(names: list[str]) -> dict[str, list[str]]:
-    """Base name -> component variable names (exovista's suffix convention).
-
-    A group is returned only if its suffixes are exactly
-    ``component_suffixes(n)`` for its size ``n >= 2`` and the base name is not
-    itself a variable. Components are ordered by that convention.
-    """
-    candidates: dict[str, dict[str, str]] = {}
-    for name in names:
-        base, sep, suffix = name.rpartition("_")
-        if not base or not sep:
-            continue
-        if suffix not in _LETTER_SUFFIXES and not (
-            suffix.isascii() and suffix.isdigit() and str(int(suffix)) == suffix
-        ):
-            continue
-        candidates.setdefault(base, {})["_" + suffix] = name
-    existing = set(names)
-    groups = {}
-    for base, by_suffix in candidates.items():
-        n = len(by_suffix)
-        if n < 2 or base in existing:
-            continue
-        expected = component_suffixes(n)
-        if set(expected) == set(by_suffix):
-            groups[base] = [by_suffix[s] for s in expected]
-    return groups
-
-
 def _plan(names: list[str], combine: bool) -> list[tuple[str, tuple[str, ...]]]:
     """``(output name, component names)`` per output array, in file order."""
     if not combine:
         return [(name, (name,)) for name in names]
-    groups = _component_groups(names)
+    groups = component_groups(names)
     position = {name: i for i, name in enumerate(names)}
     first = {}
     member = set()
