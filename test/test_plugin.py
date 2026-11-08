@@ -7,7 +7,6 @@ any PyVista; the ``mesh.save`` tests need the registry and an installed
 exovista (``pip install -e .``) so that the entry points exist.
 """
 import os
-import warnings
 from importlib import metadata
 
 import netCDF4
@@ -16,6 +15,7 @@ import pytest
 import pyvista as pv
 
 import exovista
+from _pvcompat import exodus_reader, extract_surface
 from exovista._pyvista_plugin import EXTENSIONS, save_exodus
 
 HANDLER = "exovista._pyvista_plugin:save_exodus"
@@ -50,14 +50,12 @@ def hexes(n=2):
 
 
 def surface_of(mesh):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", pv.PyVistaFutureWarning)
-        return mesh.extract_surface(algorithm=None)
+    return extract_surface(mesh)  # algorithm=None: outward faces
 
 
 def vtk_read(path):
     """Read with VTK's own Exodus reader (independent of exovista)."""
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.enable_all_point_arrays()
     reader.enable_all_cell_arrays()
     return reader.read()
@@ -162,7 +160,7 @@ def test_save_forwards_write_exo_keywords(registry, tmp_path):
     )
 
     assert vtk_block_names(path) == ["left", "right"]
-    assert pv.ExodusIIReader(str(path)).number_time_points == 3
+    assert exodus_reader(str(path)).number_time_points == 3
     assert zlib_level(path) == 0
 
     back = exovista.read_exo(path, time_step=2)

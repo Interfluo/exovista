@@ -64,9 +64,13 @@ def _unbind_shadowing_submodules():
     names and submodule names.  Importing :mod:`exovista.legacy` imported
     those submodules, which binds the *module* objects as attributes of this
     package and would shadow the deprecated callables served by
-    ``__getattr__``.  Drop those bindings; the submodules stay importable
-    (they remain in ``sys.modules``, so ``import exovista.lineout`` does not
-    re-bind them).
+    ``__getattr__``.  Drop those bindings; the submodules stay in
+    ``sys.modules`` (``importlib.import_module("exovista.lineout")`` returns
+    the module, and ``import exovista.lineout`` does not re-bind it).  Any
+    access through the package attribute, including
+    ``import exovista.lineout as m`` and ``from exovista import lineout``,
+    gives the deprecated callable (with the warning), as in 1.x where these
+    names were functions too.
     """
     namespace = globals()
     for name in _LEGACY_NAMES.intersection(namespace):

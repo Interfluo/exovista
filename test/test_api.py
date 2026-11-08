@@ -220,16 +220,18 @@ def test_package_and_examples_do_not_use_deprecated_names():
 # import hygiene
 # --------------------------------------------------------------------------- #
 _IMPORT_CHECK = r"""
-import logging, sys, warnings
+import importlib.util, logging, os, sys, warnings
 
 filters = list(warnings.filters)
 root_handlers = list(logging.root.handlers)
 root_level = logging.root.level
+package = os.path.dirname(importlib.util.find_spec("exovista").origin)
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always")
     import exovista
 ours = [str(w.message) for w in caught
-        if "exovista" in w.filename or str(w.message).startswith("exovista")]
+        if os.path.abspath(w.filename).startswith(package + os.sep)
+        or str(w.message).startswith("exovista")]
 assert not ours, ours
 assert list(warnings.filters) == filters, "import changed the warning filters"
 assert list(logging.root.handlers) == root_handlers, "import configured logging"

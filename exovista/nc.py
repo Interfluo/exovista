@@ -20,13 +20,24 @@ def open(filename, mode="r"):
     return Dataset(filename, mode=mode)
 
 
-def close(*files):
+def close(*files, strict=False):
+    """Close ``files`` (open ones only); safe to call more than once.
+
+    By default errors are ignored (read handles, cleanup after an error).
+    With ``strict=True`` every file is still closed, but the first error is
+    raised: HDF5 writes deferred data and metadata when a file is closed, so a
+    file being written is only complete once its ``close()`` succeeded.
+    """
+    error = None
     for file in files:
         try:
             if file.isopen():
                 file.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            if error is None:
+                error = exc
+    if strict and error is not None:
+        raise error
 
 
 def filename(fh):
@@ -86,15 +97,22 @@ def create_variable(fh, id, type, shape, complevel=None):
         kind = "f" if int(word_size) == 4 else "d"
     else:
         kind = {str: "c", int: "i"}[type]
-    fh.createVariable(id, kind, shape, **_compression_kwds(fh, shape, complevel))
+    fh.createVariable(id, kind, shape, **_compression_kwds(fh, shape, complevel, kind))
 
 
-def _compression_kwds(fh, shape, complevel=None):
+#: Largest chunk (bytes) of a time-dependent variable; netCDF-C's default.
+MAX_CHUNK_BYTES = 4 * 1024 * 1024
+
+_ITEMSIZE = {"f": 4, "d": 8, "i": 4, "c": 1}
+
+
+def _compression_kwds(fh, shape, complevel=None, kind="d"):
     """Return netCDF4 compression keywords for createVariable, when applicable.
 
     Compression (HDF5 deflate) is only available for the HDF5 based NETCDF4
     formats. Scalar variables (no dimensions) cannot be chunked, so they are
-    left uncompressed.
+    left uncompressed. Variables over the time steps get one step per chunk
+    (see :func:`_time_chunks`).
     """
     level = config.compression_level if complevel is None else complevel
     if not level or not shape:
@@ -102,7 +120,35 @@ def _compression_kwds(fh, shape, complevel=None):
     # zlib/chunking is only supported by the HDF5 based NETCDF4* data models.
     if not str(getattr(fh, "data_model", "")).startswith("NETCDF4"):
         return {}
-    return {"zlib": True, "complevel": int(level), "shuffle": True}
+    kwds = {"zlib": True, "complevel": int(level), "shuffle": True}
+    chunks = _time_chunks(fh, shape, _ITEMSIZE.get(kind, 8))
+    if chunks is not None:
+        kwds["chunksizes"] = chunks
+    return kwds
+
+
+def _time_chunks(fh, shape, itemsize):
+    """Chunk shape ``(1, ...)`` for a ``(time_step, ...)`` variable, else None.
+
+    A compressed chunk is decompressed whole, and netCDF-C's default chunks
+    of a fixed-length time dimension span many steps, so reading one step
+    would decompress all of them. One step per chunk (the layout netCDF-C
+    uses for an unlimited time dimension) keeps single-step reads cheap; the
+    remaining dimensions are split only when a chunk would exceed
+    :data:`MAX_CHUNK_BYTES`. One-dimensional variables (the time values)
+    keep the default chunking: they are read whole.
+    """
+    if len(shape) < 2 or shape[0] != "time_step":
+        return None
+    sizes = [max(1, len(fh.dimensions[name])) for name in shape[1:]]
+    budget = max(1, MAX_CHUNK_BYTES // max(1, int(itemsize)))
+    chunks = list(sizes)
+    for i in range(len(chunks)):
+        rest = int(np.prod(chunks)) // chunks[i]
+        if chunks[i] * rest <= budget:
+            break
+        chunks[i] = max(1, min(chunks[i], budget // max(1, rest)))
+    return (1, *chunks)
 
 
 def fill_variable(fh, name, *args):

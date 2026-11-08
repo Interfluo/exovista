@@ -12,8 +12,8 @@ import netCDF4
 import numpy as np
 import pytest
 import pyvista as pv
-from pyvista.examples import cells as example_cells
 
+from _pvcompat import example_cell, exodus_reader
 from exovista import _celltypes as ct
 from exovista import read_pyvista as rp
 from exovista._backend import write_model
@@ -54,7 +54,7 @@ def _side_cases():
 
 def _one_element_file(path, exo_name, num_dim, side_order=None):
     info = ct.resolve_exo_type(exo_name, num_dim=num_dim)
-    cell = getattr(example_cells, _EXAMPLES[info.vtk_type])()
+    cell = example_cell(_EXAMPLES[info.vtk_type])
     pts = np.round(np.asarray(cell.points, dtype=float) * 64) / 64
     if num_dim == 2:
         pts[:, 2] = 0.0
@@ -84,7 +84,7 @@ def test_side_geometry_matches_vtk_reader(tmp_path, exo_name, num_dim):
         "all"
     ]
 
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.side_sets.enable_all()
     oracle = reader.read()["Side Sets"]
     corners = points[exo_conn[: info.n_corners]]
@@ -208,7 +208,7 @@ def test_side_sets_match_vtk_geometry_on_a_box(tmp_path):
     path = tmp_path / "box.exo"
     write_model(path, model)
     ours = rp.read_side_sets(path)
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.side_sets.enable_all()
     oracle = reader.read()["Side Sets"]
     for name in ("bottom", "xmax"):
@@ -244,7 +244,7 @@ def test_2d_side_sets_are_lines(tmp_path):
     lines = [tuple(mesh.get_cell(i).point_ids) for i in range(4)]
     assert lines == [(0, 1), (1, 4), (4, 5), (3, 0)]
     np.testing.assert_array_equal(mesh.points[:, 2], 0.0)
-    reader = pv.ExodusIIReader(str(tmp_path / "2d.exo"))
+    reader = exodus_reader(str(tmp_path / "2d.exo"))
     reader.side_sets.enable_all()
     vtk_mesh = reader.read()["Side Sets"]["edges"]
     np.testing.assert_array_equal(vtk_mesh.cell_centers().points,
@@ -314,7 +314,7 @@ def test_node_sets(tmp_path):
 
     # VTK's reader: the same nodes (it numbers the sets' points itself)
     grid = rp.read_exo(path)
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.node_sets.enable_all()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

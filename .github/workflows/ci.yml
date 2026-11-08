@@ -12,8 +12,10 @@ on:
 permissions:
   contents: read
 
+# The event name keeps the weekly scheduled run (and manual runs) out of the
+# group of pushes to main, so that a merge does not cancel them.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -78,6 +80,8 @@ jobs:
           python-version: "3.10"
           cache: pip
           cache-dependency-path: pyproject.toml
+      # PyVista < 0.44 does not work with VTK >= 9.4 (VTK is PyVista's
+      # dependency, not exovista's, so it is constrained here only).
       - name: Pin every runtime dependency to its declared lower bound
         shell: python
         run: |
@@ -89,10 +93,13 @@ jobs:
           assert pins, "no lower bounds found in [project].dependencies"
           with open("constraints-oldest.txt", "w", encoding="utf-8") as fh:
               fh.writelines(f"{name}=={version}\n" for name, version in pins)
+              fh.write("vtk<9.4\n")
           print(open("constraints-oldest.txt", encoding="utf-8").read())
       - name: Install exovista with the oldest dependencies
         run: python -m pip install -c constraints-oldest.txt -e ".[test]"
       - run: python -m pip list
+      # Tests whose VTK oracles or helpers need a newer PyVista skip here; the
+      # summary (-ra in test/pytest.ini) lists them with the reason.
       - name: Run the test suite
         run: python -m pytest test -p no:cacheprovider -q
 

@@ -8,19 +8,22 @@ Coordinates are multiples of 1/64 so they survive VTK's float32 points exactly.
 import inspect
 import logging
 import os
+import warnings
 
 import netCDF4
 import numpy as np
 import pytest
 import pyvista as pv
-from pyvista.examples import cells as example_cells
 
+from _pvcompat import example_cell, exodus_reader, vtk_measures
 from exovista import _celltypes as ct
 from exovista._backend import open_reader
 from exovista._celltypes import UnsupportedCellTypeError
+from exovista.read_pyvista import read_exo
 from exovista.write_pyvista import write_exo
 
 CT = pv.CellType
+VTK_VERSION = tuple(pv.vtk_version_info)[:2]
 
 # VTK type -> (Exodus type in a num_dim=2 file, in a num_dim=3 file). Spelled
 # out here, independently of exovista._celltypes. The linear tetrahedron, wedge
@@ -82,7 +85,7 @@ _NATIVE = {
 # --------------------------------------------------------------------------- #
 def vtk_read(path):
     """Read ``path`` with VTK's reader: all arrays, sets and global element ids."""
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.enable_all_point_arrays()
     reader.enable_all_cell_arrays()
     reader.side_sets.enable_all()
@@ -167,12 +170,15 @@ def mixed_grid():
         CT.PYRAMID: [[0, 3, 2, 1, 12]],
     }
     grid = make_grid(cells, points)
-    assert np.all(grid.compute_cell_sizes()["Volume"] > 0)
+    volumes = grid.compute_cell_sizes()["Volume"]
+    if VTK_VERSION < (9, 7):  # older VTK measures this valid wedge as negative
+        volumes = volumes[grid.celltypes != CT.WEDGE]
+    assert np.all(volumes > 0)
     return grid
 
 
 def _reference_points(vtk_type, num_dim):
-    cell = getattr(example_cells, _EXAMPLE[vtk_type])()
+    cell = example_cell(_EXAMPLE[vtk_type])
     pts = np.round(np.asarray(cell.points, dtype=float) * 64) / 64
     n = len(pts)
     assert len(np.unique(pts, axis=0)) == n
@@ -226,14 +232,21 @@ def test_cell_type_written_and_read_by_vtk(tmp_path, vtk_type, num_dim):
     ):
         size = "Volume" if vtk_type in _SOLID else "Area"
         expected = grid.compute_cell_sizes()[size]
-        assert np.all(expected > 0)
+        assert np.all(expected > 0) or not vtk_measures(vtk_type)
         np.testing.assert_allclose(vtk_grid.compute_cell_sizes()[size], expected)
 
 
 def test_voxels_and_hexahedra_share_a_block(tmp_path):
     voxel = pv.ImageData(dimensions=(2, 2, 2)).cast_to_unstructured_grid()
     hexa = hex_grid(1, 1, 1, origin=(1.0, 0.0, 0.0))
-    grid = pv.merge([hexa, voxel, hexa.translate((1, 0, 0))], merge_points=False)
+    parts = [hexa, voxel, hexa.translate((1, 0, 0))]
+    # built by hand: pv.merge orders the cells differently in older PyVista
+    grid = pv.UnstructuredGrid(
+        np.concatenate([np.r_[8, p.cell_connectivity + 8 * k]
+                        for k, p in enumerate(parts)]),
+        np.array([p.celltypes[0] for p in parts], dtype=np.uint8),
+        np.vstack([np.asarray(p.points, dtype=float) for p in parts]),
+    )
     assert list(grid.celltypes) == [CT.HEXAHEDRON, CT.VOXEL, CT.HEXAHEDRON]
     write_exo(tmp_path / "hv.exo", grid)
     assert file_blocks(tmp_path / "hv.exo") == [(1, "block_1", "HEX8", 3)]
@@ -258,7 +271,7 @@ def test_voxels_and_hexahedra_share_a_block(tmp_path):
     ],
 )
 def test_unsupported_cells_raise_and_leave_no_file(tmp_path, example):
-    bad = getattr(example_cells, example)()
+    bad = example_cell(example)
     grid = pv.merge(
         [hex_grid(1, 1, 1, origin=(5, 5, 5)), bad, bad.translate((9, 0, 0))]
     )
@@ -281,7 +294,7 @@ def test_unsupported_cells_raise_and_leave_no_file(tmp_path, example):
 
 def test_unsupported_error_suggests_fixes(tmp_path):
     with pytest.raises(ValueError, match=r"triangulate\(\).*extract_cells_by_type"):
-        write_exo(tmp_path / "p.exo", example_cells.Polygon())
+        write_exo(tmp_path / "p.exo", example_cell("Polygon"))
 
 
 # --------------------------------------------------------------------------- #
@@ -295,15 +308,24 @@ def _num_dim_and_types(path):
 def test_num_dim_auto_flat_mesh_is_2d(tmp_path):
     write_exo(tmp_path / "a.exo", quad_grid())
     assert _num_dim_and_types(tmp_path / "a.exo") == (2, ["QUAD4"])
-    # a constant z other than 0 is dropped
-    write_exo(tmp_path / "b.exo", quad_grid(z=5.0))
+    # a constant z other than 0 is dropped, with a warning
+    with pytest.warns(UserWarning, match="flat at z = 5.*reads back at z = 0"):
+        write_exo(tmp_path / "b.exo", quad_grid(z=5.0))
     assert _num_dim_and_types(tmp_path / "b.exo") == (2, ["QUAD4"])
     grid = vtk_read(tmp_path / "b.exo")["Element Blocks"][0]
     np.testing.assert_array_equal(np.asarray(grid.points)[:, 2], 0.0)
-    # tiny z noise relative to the bounding box still counts as flat
+    # ... but not when num_dim=2 is explicit; num_dim=3 keeps z
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        write_exo(tmp_path / "b2.exo", quad_grid(z=5.0), num_dim=2)
+        write_exo(tmp_path / "b3.exo", quad_grid(z=5.0), num_dim=3)
+    np.testing.assert_array_equal(read_exo(tmp_path / "b3.exo").points[:, 2], 5.0)
+    # tiny z noise relative to the bounding box still counts as flat (at 0)
     noisy = quad_grid()
     noisy.points[:, 2] = 1e-14 * np.random.default_rng(0).random(noisy.n_points)
-    write_exo(tmp_path / "c.exo", noisy)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        write_exo(tmp_path / "c.exo", noisy)
     assert _num_dim_and_types(tmp_path / "c.exo") == (2, ["QUAD4"])
 
 
@@ -361,10 +383,11 @@ def test_2d_cells_in_3d_are_shells(tmp_path):
         CT.TRIANGLE, CT.QUADRATIC_TRIANGLE, CT.QUAD, CT.QUADRATIC_QUAD,
         CT.BIQUADRATIC_QUAD, CT.PIXEL,
     )]
+    for i, c in enumerate(cells, start=1):  # (pv.merge's cell order varies)
+        c.cell_data["region"] = np.full(c.n_cells, i)
     grid = pv.merge(
         [c.translate((0, 3 * i, 0)) for i, c in enumerate(cells)], merge_points=False
     )
-    grid.cell_data["region"] = np.repeat(np.arange(1, 7), 2)
     write_exo(tmp_path / "shells.exo", grid)
     num_dim, types = _num_dim_and_types(tmp_path / "shells.exo")
     assert num_dim == 3
@@ -589,7 +612,13 @@ def test_region_key_and_missing_region(tmp_path):
     grid.cell_data["mat"] = [5, 5, 6]
     write_exo(tmp_path / "k.exo", grid, region_key="mat")
     assert [b[0] for b in file_blocks(tmp_path / "k.exo")] == [5, 6]
-    write_exo(tmp_path / "none.exo", grid, region_key="nope")
+    # a region_key the caller chose must exist (a typo must not give 1 block)
+    with pytest.raises(KeyError, match="'nope' is not a cell array.*'mat'"):
+        write_exo(tmp_path / "none.exo", grid, region_key="nope")
+    assert not (tmp_path / "none.exo").exists()
+    # the default key may be missing: one region
+    del grid.cell_data["region"]
+    write_exo(tmp_path / "none.exo", grid)
     assert file_blocks(tmp_path / "none.exo") == [(1, "block_1", "HEX8", 3)]
     write_exo(tmp_path / "none2.exo", grid, region_key=None)
     assert file_blocks(tmp_path / "none2.exo") == [(1, "block_1", "HEX8", 3)]
@@ -643,8 +672,9 @@ def test_block_names_land_on_their_blocks(tmp_path):
     """1.x named blocks in (cell type, region) order: names hit wrong blocks."""
     tris = pv.Plane(i_resolution=2, j_resolution=2).triangulate()
     quads = pv.Plane(i_resolution=2, j_resolution=2, center=(2, 0, 0))
+    quads.cell_data["region"] = np.zeros(quads.n_cells, int)
+    tris.cell_data["region"] = np.ones(tris.n_cells, int)
     grid = pv.merge([quads, tris], merge_points=False)
-    grid.cell_data["region"] = [0] * quads.n_cells + [1] * tris.n_cells
     write_exo(tmp_path / "n.exo", grid, block_names=["quads", "tris"])
     assert file_blocks(tmp_path / "n.exo") == [
         (1, "quads", "QUAD4", 4), (2, "tris", "TRI3", 8)

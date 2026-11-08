@@ -90,20 +90,21 @@ def read_exo(
         stored in the file (``"velocity_X"``). Unknown names raise
         ``KeyError``.
     read_global_variables : bool, str or list of str
-        Which global variables to store in ``grid.field_data`` (one-element
-        arrays holding the value at ``time_step``). Same semantics.
+        Which global variables to store in ``grid.field_data``: arrays holding
+        the value at ``time_step``, of shape ``(1,)``, or ``(1, n_components)``
+        for recombined components. Same semantics.
     read_side_sets : bool, default: False
         Also return the side sets (see :func:`read_side_sets`).
     combine_components : bool, default: True
-        Recombine scalar variables named with exovista's component suffixes
-        (``_X, _Y[, _Z]``; symmetric tensors ``_XX, _YY, _ZZ, _XY, _YZ,
-        _XZ``; full tensors ``_XX, _XY, ... _ZZ``; otherwise ``_0 .. _{n-1}``)
-        into one multi-component array, but only when all components of the
-        array are present and the combined name is not itself a variable.
-        Letter and digit suffixes are grouped separately and the largest
-        complete set wins, so another variable that merely shares the base
-        name (``V_0`` next to ``V_X, V_Y, V_Z``) stays a scalar (see
-        :func:`exovista._model.component_groups`).
+        Recombine scalar node, element and global variables named with
+        exovista's component suffixes (``_X, _Y[, _Z]``; symmetric tensors
+        ``_XX, _YY, _ZZ, _XY, _YZ, _XZ``; full tensors ``_XX, _XY, ... _ZZ``;
+        otherwise ``_0 .. _{n-1}``) into one multi-component array, but only
+        when all components of the array are present and the combined name
+        is not itself a variable. Letter and digit suffixes are grouped
+        separately and the largest complete set wins, so another variable
+        that merely shares the base name (``V_0`` next to ``V_X, V_Y,
+        V_Z``) stays a scalar (see :func:`exovista._model.component_groups`).
     original_order : bool, default: True
         If the element id map is a permutation of ``1..num_elem`` (as written
         by :func:`exovista.write_exo`), return the cells sorted by element id,
@@ -174,11 +175,14 @@ def read_exo(
                 grid.cell_data[out_name] = _stack(values, components, out_name)
 
             glob_plan = _select(
-                _plan(r.global_var_names(), False), read_global_variables, "global"
+                _plan(r.global_var_names(), combine_components),
+                read_global_variables,
+                "global",
             )
             glob_plan = _drop_reserved(glob_plan, _RESERVED_FIELD_DATA, "global")
-            for out_name, (name,) in glob_plan:
-                grid.field_data[out_name] = np.array([r.global_var(name, step)])
+            for out_name, components in glob_plan:
+                values = [np.array([r.global_var(name, step)]) for name in components]
+                grid.field_data[out_name] = _stack(values, components, out_name)
 
         grid.field_data["times"] = times
         if step is not None:
@@ -331,8 +335,10 @@ def read_element_fields(
         return out
 
 
-def read_global_fields(filename, *files, names=None):
+def read_global_fields(filename, *files, names=None, combine_components=False):
     """Read global-variable time histories.
+
+    Inverse of the ``global_fields`` argument of :func:`exovista.write_exo`.
 
     Parameters
     ----------
@@ -340,19 +346,25 @@ def read_global_fields(filename, *files, names=None):
         As for :func:`read_exo`.
     names : str or list of str, optional
         Variables to read (default: all). Unknown names raise ``KeyError``.
+    combine_components : bool, default: False
+        Recombine component variables as in :func:`read_exo`.
 
     Returns
     -------
     dict of str to numpy.ndarray
-        ``(n_steps,)`` float64 arrays.
+        ``(n_steps,)`` float64 arrays, or ``(n_steps, n_components)`` for
+        combined arrays.
     """
     with open_reader(filename, *files) as r:
-        plan = _select(_plan(r.global_var_names(), False), _names(names), "global")
+        plan = _select(
+            _plan(r.global_var_names(), combine_components), _names(names), "global"
+        )
         n_steps = r.num_steps
-        return {
-            out_name: _history(r.global_var(name), (n_steps,))
-            for out_name, (name,) in plan
-        }
+        out = {}
+        for out_name, components in plan:
+            values = [_history(r.global_var(name), (n_steps,)) for name in components]
+            out[out_name] = _stack(values, components, out_name)
+        return out
 
 
 # --------------------------------------------------------------------------- #

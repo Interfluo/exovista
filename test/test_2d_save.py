@@ -9,8 +9,8 @@ attached helper arrays with ``surface[name] = ...``.
 import numpy as np
 import pytest
 import pyvista as pv
-from pyvista.examples import cells as example_cells
 
+from _pvcompat import example_cell, exodus_reader
 from exovista._backend import open_reader
 from exovista.write_pyvista import write_exo
 
@@ -18,7 +18,7 @@ CT = pv.CellType
 
 
 def vtk_read(path):
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.side_sets.enable_all()
     reader.reader.GenerateGlobalElementIdArrayOn()
     return reader.read()
@@ -172,7 +172,7 @@ def test_pixels(tmp_path):
                                      "BiQuadraticQuadrilateral"])
 @pytest.mark.parametrize("quadratic_edges", [True, False])
 def test_quadratic_elements(tmp_path, example, quadratic_edges):
-    grid = getattr(example_cells, example)()
+    grid = example_cell(example)
     grid.points[:, 2] = 0.0
     cell = grid.get_cell(0)
     if quadratic_edges:

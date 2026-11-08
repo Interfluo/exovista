@@ -93,6 +93,18 @@ _PRECISIONS = {"double": 8, "float64": 8, "single": 4, "float32": 4}
 
 #: z extent (relative to the bounding-box diagonal) below which a mesh is flat.
 _FLAT_RTOL = 1e-12
+#: Longest title (bytes) Exodus readers keep (MAX_LINE_LENGTH).
+_MAX_TITLE_BYTES = 80
+#: Field data :func:`exovista.read_exo` always adds (not global variables).
+_READ_EXO_FIELD_DATA = ("times", "time", "num_dim")
+#: Field data of VTK's Exodus reader that is not a global variable.
+_VTK_FIELD_DATA = frozenset(
+    {
+        "ElementBlockIds", "FaceBlockIds", "EdgeBlockIds", "ElementSetIds",
+        "SideSetIds", "FaceSetIds", "EdgeSetIds", "NodeSetIds", "Title",
+        "QA Records", "Info Records", "TimeValue",
+    }
+)
 #: Default side-set matching tolerance, relative to the bounding-box diagonal.
 _SIDE_SET_RTOL = 1e-6
 #: Volume nodes closer than this (relative to the bounding-box diagonal) are
@@ -136,8 +148,10 @@ def write_exo(
         moved into place only when complete: on any error no file is created
         (an existing file is left untouched). If ``filename`` is a symbolic
         link, the file it points to is replaced; an existing file keeps its
-        permissions. The time dimension has a fixed length (fast to read),
-        so time steps cannot be appended to the file afterwards.
+        permissions, and one that is not writable raises ``PermissionError``.
+        The time dimension has a fixed length and variables are stored one
+        time step per compressed chunk (a single step is fast to read), so
+        time steps cannot be appended to the file afterwards.
     volume : pyvista.DataSet or pyvista.MultiBlock
         The mesh. Any dataset is accepted (it is cast with
         ``cast_to_unstructured_grid()`` when needed). For a ``MultiBlock``,
@@ -160,21 +174,29 @@ def write_exo(
         its other entities are ignored with a warning. Its nodes are merged
         by ``GlobalNodeId`` when present (enable it with
         ``reader.reader.GenerateGlobalNodeIdArrayOn()`` to keep coincident
-        nodes apart and the file's node order), else by coordinates. Note
-        that VTK's reader moves the points by displacement variables
-        (``DISPL*``) unless told otherwise. The input is never modified.
+        nodes apart and the file's node order), else by coordinates, which
+        joins distinct nodes at the same place (contact surfaces): a warning
+        is given when merged points of one block, or point values that
+        differ, show this. Its global variables (whole histories in the
+        field data) are not written (pass ``global_fields``). Note that VTK's
+        reader moves the points by displacement variables (``DISPL*``)
+        unless told otherwise. The input is never modified.
     surface : pyvista.DataSet, optional
         Boundary faces (3D meshes) or edges (``num_dim=2`` meshes) to write as
-        side sets, e.g. ``volume.extract_surface()`` or a subset of it (for
-        quadratic cells use ``volume.extract_surface(nonlinear_subdivision=0)``:
+        side sets, e.g. ``volume.extract_surface(algorithm=None)`` or a
+        subset of it (for quadratic cells use
+        ``volume.extract_surface(algorithm=None, nonlinear_subdivision=0)``:
         by default pyvista splits each quadratic face into linear faces that
-        match no element side). Each surface cell must match the side of an
+        match no element side; ``algorithm=`` needs PyVista >= 0.47, see the
+        Notes on side sets). Each surface cell must match the side of an
         element (see Notes). One side set is written per value of
         ``surface.cell_data[region_key]`` (or a single set without it).
     region_key : str, default "region"
         Name of the cell array that assigns cells to regions, on both
         ``volume`` and ``surface``. Integer or string values. Without it the
-        whole mesh (surface) is one region.
+        whole mesh (surface) is one region. Any other name than the default
+        must be a cell array of ``volume`` or ``surface`` (``KeyError``
+        otherwise), so that a misspelt name cannot merge the regions.
     block_names : list or dict or str, optional
         Element-block names: a list ordered like the sorted unique region
         values, a dict ``{region_value: name}`` (regions not in the dict keep
@@ -213,12 +235,22 @@ def write_exo(
         replaces a cell array of the same name.
     global_fields : dict, optional
         Global variables ``{name: values}`` of shape ``(n_steps,)`` (or
-        ``(n_steps, n_components)``).
+        ``(n_steps, n_components)``, split into components like other
+        arrays). The global variables in the field data of
+        :func:`exovista.read_exo` output (recognised by its ``times`` and
+        ``num_dim`` field data) are written too, constant in time; a name
+        here replaces one of them.
     num_dim : {None, 2, 3}, optional
-        Spatial dimension of the file. ``None`` (default): 2 when the mesh has
-        no 3D cells and all points share one z coordinate (z is then dropped),
-        else 3. In a ``num_dim=3`` file, 2D cells are written as shells
-        (``TRISHELL*``/``SHELL*``).
+        Spatial dimension of the file. ``None`` (default): 3 for
+        :func:`exovista.read_exo` output of a 3D file (``field_data["num_dim"]``
+        is 3); otherwise 2 when the mesh has no 3D cells and all points share
+        one z coordinate, else 3. A 2D file stores no z: a flat mesh at a z
+        other than 0 reads back at z = 0 (a warning says so; pass
+        ``num_dim=3`` to keep z). VTK reader output does not record the
+        dimension of the file it was read from, so writing it as a 2D file
+        automatically warns too. In a ``num_dim=3`` file, 2D cells are
+        written as shells: ``TRI3``/``TRI6`` (triangular shells),
+        ``SHELL4``/``SHELL8``, and biquadratic quads as ``QUAD9``.
     precision : {"double", "single"}, default "double"
         Floating point storage of coordinates, times and variables.
     compression_level : int, optional
@@ -229,7 +261,8 @@ def write_exo(
         matched to (its nearest node). Default ``1e-6`` times the
         bounding-box diagonal.
     title : str, optional
-        Database title (default ``"exovista"``).
+        Database title (default ``"exovista"``); at most 80 bytes (UTF-8),
+        the most Exodus readers keep: a longer title is cut, with a warning.
 
     Raises
     ------
@@ -239,6 +272,11 @@ def write_exo(
         that does not match the volume, inconsistent names / shapes, etc.
     TypeError
         For inputs of the wrong type.
+    KeyError
+        For a ``region_key`` (other than the default) that names no cell
+        array.
+    PermissionError
+        When ``filename`` exists and is not writable.
 
     Notes
     -----
@@ -295,8 +333,9 @@ def write_exo(
     surface normal points out of, so the faces of
     ``region_mesh.extract_surface(algorithm=None)`` belong to that region
     (with ``algorithm="dataset_surface"``, pyvista's default up to at least
-    0.49, VTK's ``vtkDataSetSurfaceFilter`` orients the faces of linear
-    wedges inward, so their interface faces would go to the neighbour); for
+    0.49 and the only choice before 0.47, VTK's ``vtkDataSetSurfaceFilter``
+    orients the faces of linear wedges inward, so their interface faces
+    would go to the neighbour); for
     2D edges the in-plane normal ``(dy, -dx)`` of the edge direction is used
     (outward for counter-clockwise boundaries). Ties go to the element with
     the lower block id, then the lower element index. Repeated faces within
@@ -308,8 +347,13 @@ def write_exo(
     compression_level = _compression_level(compression_level)
     notes: list[str] = []
 
-    grid, regions, vtk_sets = _prepare_volume(volume, region_key, notes)
-    cells = _collect_cells(grid, num_dim)
+    title = _title(title, notes)
+    grid, regions, vtk_sets = _prepare_volume(
+        volume, region_key, notes, num_dim, surface
+    )
+    if num_dim is None and _stored_num_dim(volume) == 3:
+        num_dim = 3  # read_exo output of a 3D file (e.g. a planar shell model)
+    cells = _collect_cells(grid, num_dim, notes, vtk_sets is not None)
     layout = _layout_blocks(cells, regions, block_names)
     side_sets = []
     if surface is not None:
@@ -329,13 +373,14 @@ def write_exo(
         node_fields=node_fields,
         element_fields=element_fields,
         global_fields=global_fields,
+        static_globals=_field_globals(volume, global_fields, notes),
         save_node_arrays=save_node_arrays,
         save_cell_arrays=save_cell_arrays,
         float_word_size=float_word_size,
         notes=notes,
     )
     model = ExodusModel(
-        title="exovista" if title is None else str(title),
+        title=title,
         num_dim=cells.num_dim,
         coords=cells.points[:, : cells.num_dim],
         blocks=layout.blocks,
@@ -371,6 +416,82 @@ def _float_word_size(precision) -> int:
     if key in _PRECISIONS:
         return _PRECISIONS[key]
     raise ValueError(f"precision must be 'double' or 'single', got {precision!r}")
+
+
+def _title(title, notes) -> str:
+    """The database title, cut to the 80 bytes Exodus readers keep."""
+    title = "exovista" if title is None else str(title)
+    raw = title.encode("utf-8")
+    if len(raw) <= _MAX_TITLE_BYTES:
+        return title
+    notes.append(
+        f"truncated the title to {_MAX_TITLE_BYTES} bytes, the longest title "
+        f"Exodus readers keep (it had {len(raw)})"
+    )
+    return raw[:_MAX_TITLE_BYTES].decode("utf-8", "ignore")
+
+
+def _stored_num_dim(volume):
+    """``field_data["num_dim"]`` of :func:`exovista.read_exo` output, or None."""
+    field_data = getattr(volume, "field_data", None)
+    if field_data is None or "num_dim" not in field_data.keys():
+        return None
+    value = np.asarray(field_data["num_dim"]).reshape(-1)
+    if value.size != 1 or value.dtype.kind not in "iuf":
+        return None
+    return int(value[0]) if value[0] in (1, 2, 3) else None
+
+
+def _field_globals(volume, global_fields, notes) -> dict:
+    """Global variables found in the field data of reader output.
+
+    For :func:`exovista.read_exo` output (recognised by its ``times`` and
+    ``num_dim`` field data), every other field array holds a global variable
+    at the read step: ``{name: (1, n_components)}``. VTK's reader stores whole
+    histories at the leaves instead; those are reported, not written.
+    """
+    given = set(global_fields or ())
+    if isinstance(volume, pv.MultiBlock):
+        if not _is_exodus_reader_output(volume) and not all(
+            "ElementBlockIds" in leaf.field_data.keys()
+            for _, leaf in _leaves(volume, [])
+        ):
+            return {}
+        names = {
+            str(name)
+            for _, leaf in _leaves(
+                volume["Element Blocks"] if _is_exodus_reader_output(volume)
+                else volume, [])
+            for name in leaf.field_data.keys()
+            if name not in _VTK_FIELD_DATA and name not in given
+            and np.asarray(leaf.field_data[name]).dtype.kind in "biuf"
+        }
+        if names:
+            notes.append(
+                f"did not write the global variables {sorted(names)} of the VTK "
+                "reader output (field data holds whole histories); pass them "
+                "with global_fields= (and times=)"
+            )
+        return {}
+    field_data = getattr(volume, "field_data", None)
+    if field_data is None or not all(
+        key in field_data.keys() for key in ("times", "num_dim")
+    ):
+        return {}
+    out = {}
+    for name in field_data.keys():
+        if name in _READ_EXO_FIELD_DATA or name in given:
+            continue
+        values = np.asarray(field_data[name])
+        if values.ndim not in (1, 2) or values.shape[0] != 1:
+            notes.append(
+                f"skipped field data array {name!r}: a global variable of "
+                "read_exo output holds one value (or one tuple), got shape "
+                f"{values.shape}"
+            )
+            continue
+        out[str(name)] = values
+    return out
 
 
 def _compression_level(level):
@@ -476,7 +597,8 @@ def _merge_exact(points: np.ndarray):
     return first[by_first], rank[group]
 
 
-def _combine_leaves(leaves: list, region_key, notes, node_key=None):
+def _combine_leaves(leaves: list, region_key, notes, node_key=None,
+                    vtk_reader=False):
     """One UnstructuredGrid from MultiBlock leaves (leaf after leaf).
 
     Points with equal coordinates are merged (``merge_points=True``), or,
@@ -484,8 +606,9 @@ def _combine_leaves(leaves: list, region_key, notes, node_key=None):
     ``MultiBlock.combine``, arrays that only some leaves have are kept: cell
     arrays are NaN on the other leaves' cells, point arrays NaN on points no
     leaf with the array has (a merged point takes the first leaf's value that
-    is not NaN). Each leaf's ``region_key`` array is ignored (the leaves are
-    the regions).
+    is not NaN; differing values are reported). Each leaf's ``region_key``
+    array is ignored (the leaves are the regions). ``vtk_reader``: the leaves
+    are VTK Exodus-reader blocks, whose own points are distinct nodes.
     """
     grids = [_as_unstructured(leaf, "volume") for leaf in leaves]
     points = np.concatenate(
@@ -498,8 +621,28 @@ def _combine_leaves(leaves: list, region_key, notes, node_key=None):
         )
         _, first, inverse = np.unique(ids, return_index=True, return_inverse=True)
         inverse = inverse.reshape(-1)
+        by_coordinates = False
     else:
         first, inverse = _merge_exact(points)
+        by_coordinates = True
+    hint = (
+        "enable reader.reader.GenerateGlobalNodeIdArrayOn() before reading to "
+        "keep them apart" if vtk_reader else
+        "to keep them apart, give each leaf a region array and pass "
+        "multiblock.combine(merge_points=False)"
+    )
+    if by_coordinates and vtk_reader:
+        within = sum(
+            int(b - a) - np.unique(inverse[a:b]).size
+            for a, b in zip(starts[:-1], starts[1:])
+        )
+        if within:
+            notes.append(
+                f"merged {within} point(s) of the VTK reader output with the "
+                "coordinates of another point of the same element block (there "
+                "is no GlobalNodeId array, so nodes are merged by coordinates): "
+                f"distinct nodes were joined; {hint}"
+            )
 
     celltypes = np.concatenate([np.asarray(g.celltypes, dtype=np.uint8)
                                 for g in grids])
@@ -534,11 +677,23 @@ def _combine_leaves(leaves: list, region_key, notes, node_key=None):
     ):
         grid.cell_data[name] = values
     leaf_points = [inverse[a:b] for a, b in zip(starts[:-1], starts[1:])]
+    conflicts = []
     for name, parts in _union_arrays(
         [g.point_data for g in grids], [g.n_points for g in grids], "point",
         notes, combine=False,
     ):
-        grid.point_data[name] = _merge_point_values(parts, leaf_points, first.size)
+        values, conflict = _merge_point_values(parts, leaf_points, first.size)
+        grid.point_data[name] = values
+        if conflict and name not in _EXCLUDED_ARRAYS:
+            conflicts.append(name)
+    if conflicts:
+        notes.append(
+            f"point array(s) {conflicts} have different values at points of the "
+            "MultiBlock leaves merged by "
+            f"{'coordinates' if by_coordinates else node_key} (the first "
+            "leaf's value was kept): these are distinct nodes at the same "
+            f"place, e.g. on a contact surface; {hint}"
+        )
     return grid
 
 
@@ -591,17 +746,32 @@ def _union_arrays(datas: list, sizes: list, what: str, notes, skip=(),
 
 
 def _merge_point_values(parts: list, leaf_points: list, n_points: int):
-    """Point array of the merged points: the first non-NaN leaf value wins."""
+    """Point array of the merged points: the first non-NaN leaf value wins.
+
+    Returns ``(values, conflict)``; ``conflict`` is True when a merged point
+    has different (non-NaN) values on different leaves (or within one leaf).
+    """
     width = parts[0].shape[1]
     dtype = np.result_type(*[p.dtype for p in parts])
     floating = dtype.kind in "fc"
     out = np.full((n_points, width), np.nan if floating else 0, dtype=dtype)
+    kept = []
     for values, index in zip(parts[::-1], leaf_points[::-1]):
         if floating:
             keep = ~np.isnan(values).all(axis=1)
             values, index = values[keep], index[keep]
         out[index] = values
-    return out[:, 0] if width == 1 else out
+        kept.append((values, index))
+    conflict = False
+    for values, index in kept:
+        stored = out[index]
+        differ = stored != values
+        if floating:
+            differ &= ~(np.isnan(stored) & np.isnan(values))
+        if np.any(differ):
+            conflict = True
+            break
+    return (out[:, 0] if width == 1 else out), conflict
 
 
 def _vtk_padded_2d(leaves: list) -> set:
@@ -701,22 +871,25 @@ class _VtkSets:
     node_ids: np.ndarray | None  # global node id of each merged point
 
 
-def _from_exodus_reader(blocks: pv.MultiBlock, mb, notes):
+def _from_exodus_reader(blocks: pv.MultiBlock, mb, notes, num_dim=None):
     """Volume, regions and sets of VTK Exodus-reader output.
 
     ``blocks`` is its "Element Blocks" MultiBlock, ``mb`` the whole output
     (None when only the element blocks were passed: then there are no sets).
+    ``num_dim`` is the requested dimension of the file (None: automatic).
     """
     leaves = _leaves(blocks, [])
     if not leaves:
         raise ValueError("cannot write an empty mesh: 'Element Blocks' has no cells")
-    padded = _vtk_padded_2d([leaf for _, leaf in leaves])
+    # VTK pads the vectors of a 2D file with zeros: undo that only for 2D output
+    padded = set() if num_dim == 3 else _vtk_padded_2d([leaf for _, leaf in leaves])
     leaves = [(name, _split_vtk_components(leaf, padded)) for name, leaf in leaves]
     names = _vtk_names(leaves)
     ids = _vtk_ids(leaves, "ElementBlockIds")
     # (the blocks are the regions: a "region" array is an ordinary variable)
     grid = _combine_leaves(
-        [leaf for _, leaf in leaves], None, notes, node_key="GlobalNodeId"
+        [leaf for _, leaf in leaves], None, notes, node_key="GlobalNodeId",
+        vtk_reader=True,
     )
     node_ids = None
     if "GlobalNodeId" in grid.point_data.keys():
@@ -753,23 +926,26 @@ def _from_exodus_reader(blocks: pv.MultiBlock, mb, notes):
     return grid, regions, sets
 
 
-def _prepare_volume(volume, region_key, notes):
+def _prepare_volume(volume, region_key, notes, num_dim=None, surface=None):
     """Return ``(grid, regions, vtk_sets)``; the input is never modified.
 
     ``vtk_sets`` holds the side / node sets of VTK Exodus-reader output (None
-    for any other input).
+    for any other input). ``num_dim`` is the requested dimension and
+    ``surface`` the side-set surface (for checking ``region_key``).
     """
     if isinstance(volume, vtkDataObject) and not isinstance(volume, pv.DataObject):
         volume = pv.wrap(volume)
     if isinstance(volume, pv.MultiBlock):
         if _is_exodus_reader_output(volume):
-            return _from_exodus_reader(volume["Element Blocks"], volume, notes)
+            return _from_exodus_reader(
+                volume["Element Blocks"], volume, notes, num_dim
+            )
         leaves = _leaves(volume, [])
         if not leaves:
             raise ValueError("cannot write an empty mesh: the MultiBlock has no cells")
         if all("ElementBlockIds" in leaf.field_data.keys() for _, leaf in leaves):
             # the "Element Blocks" of VTK's Exodus reader output
-            return _from_exodus_reader(volume, None, notes)
+            return _from_exodus_reader(volume, None, notes, num_dim)
         names = _unique_strings([name for name, _ in leaves])
         grid = _combine_leaves([leaf for _, leaf in leaves], region_key, notes)
         labels = np.repeat(
@@ -789,7 +965,32 @@ def _prepare_volume(volume, region_key, notes):
             f"cannot write an empty mesh ({grid.n_points} points, "
             f"{grid.n_cells} cells)"
         )
+    _check_region_key(grid, surface, region_key)
     return grid, _regions_of(grid, region_key, "volume"), None
+
+
+def _check_region_key(grid, surface, region_key) -> None:
+    """A region_key the caller chose must name a cell array.
+
+    The default ``"region"`` may be missing (one region); any other name must
+    be a cell array of the volume or of the surface, so that a typo does not
+    silently merge all regions into one block.
+    """
+    if region_key is None or region_key == "region" or region_key in grid.cell_data:
+        return
+    if surface is not None:
+        if isinstance(surface, vtkDataObject) and not isinstance(
+            surface, pv.DataObject
+        ):
+            surface = pv.wrap(surface)
+        data = getattr(surface, "cell_data", None)
+        if data is not None and region_key in data.keys():
+            return
+    raise KeyError(
+        f"region_key {region_key!r} is not a cell array of the volume"
+        + ("" if surface is None else " or of the surface")
+        + f"; the volume's cell arrays are {list(grid.cell_data.keys())}"
+    )
 
 
 def _use_vtk_sets(sets: _VtkSets, surface, node_sets, side_sets, nsets, cells,
@@ -1005,7 +1206,28 @@ def _is_flat(points: np.ndarray) -> bool:
     return bool(extent[2] <= _FLAT_RTOL * diag)
 
 
-def _collect_cells(grid: pv.UnstructuredGrid, num_dim) -> _Cells:
+def _note_auto_2d(points: np.ndarray, vtk_reader: bool, notes) -> None:
+    """Report what the automatic choice of a 2D file (num_dim=2) loses."""
+    z = points[:, 2]
+    extent = points.max(axis=0) - points.min(axis=0)
+    if np.abs(z).max() > _FLAT_RTOL * float(np.sqrt(np.sum(extent**2))):
+        notes.append(
+            f"the mesh is flat at z = {float(np.median(z)):g}: it is written as "
+            "a 2D file (num_dim=2), which stores no z, so it reads back at "
+            "z = 0; pass num_dim=3 to keep z (2D cells are then shells), or "
+            "num_dim=2 to accept this"
+        )
+    elif vtk_reader:
+        notes.append(
+            "writing VTK reader output as a 2D file (num_dim=2) because it is "
+            "flat and has no 3D cells; VTK's reader does not tell whether the "
+            "file it read was 2D or a planar 3D (shell) model: pass num_dim=3 "
+            "to write shells, or num_dim=2 to accept this"
+        )
+
+
+def _collect_cells(grid: pv.UnstructuredGrid, num_dim, notes=None,
+                   vtk_reader=False) -> _Cells:
     celltypes = np.asarray(grid.celltypes).astype(np.intp)
     offsets = _cell_offsets(grid)
     connectivity = np.asarray(grid.cell_connectivity, dtype=np.int64)
@@ -1029,6 +1251,8 @@ def _collect_cells(grid: pv.UnstructuredGrid, num_dim) -> _Cells:
     flat = _is_flat(points)
     if num_dim is None:
         num_dim = 2 if (not solid and flat) else 3
+        if num_dim == 2 and notes is not None:
+            _note_auto_2d(points, vtk_reader, notes)
     else:
         if isinstance(num_dim, (bool, np.bool_)) or num_dim not in (2, 3):
             raise ValueError(f"num_dim must be None, 2 or 3, got {num_dim!r}")
@@ -1732,7 +1956,8 @@ def _check_recombination(names: list, intended: dict, kind: str, notes) -> None:
 
 def _build_variables(grid, cells: _Cells, layout: _Layout, region_key, *, times,
                      node_fields, element_fields, global_fields, save_node_arrays,
-                     save_cell_arrays, notes, float_word_size=8):
+                     save_cell_arrays, notes, float_word_size=8,
+                     static_globals=None):
     node_fields = _check_mapping(node_fields, "node_fields")
     element_fields = _check_mapping(element_fields, "element_fields")
     global_fields = _check_mapping(global_fields, "global_fields")
@@ -1781,6 +2006,23 @@ def _build_variables(grid, cells: _Cells, layout: _Layout, region_key, *, times,
             )
         for scalar, col in _components(name, arr):
             _add(global_vars, scalar, col, f"global field {name!r}")
+    # global variables of read_exo output (one value), constant in time
+    for name, values in (static_globals or {}).items():
+        arr = _static(values, name, "field data", notes, ws)
+        if arr is None:
+            continue
+        parts = _components(name, arr)
+        clash = [s for s, _ in parts if s.rstrip() in global_vars]
+        if len(clash) == len(parts):
+            continue  # given by global_fields (e.g. as separate components)
+        if clash:
+            notes.append(
+                f"skipped field data array {name!r}: global variable name(s) "
+                f"{clash} already used"
+            )
+            continue
+        for scalar, col in parts:
+            global_vars[scalar.rstrip()] = np.broadcast_to(col, (n_steps,))
 
     # static arrays, broadcast over all steps
     node_static: dict = {}

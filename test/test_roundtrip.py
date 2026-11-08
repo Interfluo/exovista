@@ -36,6 +36,7 @@ from scipy.spatial import cKDTree
 from meshio.exodus._exodus import categorize as meshio_categorize
 from vtkmodules.vtkIOExodus import vtkExodusIIReader
 
+from _pvcompat import exodus_reader, requires_pyvista
 from exovista import (
     read_element_fields,
     read_exo,
@@ -89,8 +90,8 @@ def extract_surface(mesh, **kwargs):
     """``mesh.extract_surface`` without pyvista's FutureWarning on ``algorithm``."""
     if "algorithm" in inspect.signature(mesh.extract_surface).parameters:
         kwargs.setdefault("algorithm", "dataset_surface")
-    else:
-        kwargs.pop("algorithm", None)
+    elif kwargs.pop("algorithm", "dataset_surface") is None:
+        requires_pyvista("0.47", "extract_surface(algorithm=None)")
     return mesh.extract_surface(**kwargs)
 
 
@@ -192,7 +193,7 @@ def vtk_array(data, name, n_comp):
 
 
 def vtk_read(path, time_index=None):
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.enable_all_point_arrays()
     reader.enable_all_cell_arrays()
     reader.reader.SetAllArrayStatus(vtkExodusIIReader.GLOBAL, 1)

@@ -18,7 +18,17 @@ def stringify(a):
         if a.dtype.kind == "S" and a.dtype.itemsize == 1 and a.ndim in (1, 2):
             return _stringify_chars(a)
         if len(a.shape) == 1:
-            return "".join(decode(x) for x in a if x).rstrip()
+            # Like the Exodus library, a name ends at its first NUL: bytes
+            # after it are left over from a longer name written before.
+            chars = []
+            for x in a:
+                x = decode(x)
+                if not x or x.startswith("\0"):
+                    break
+                chars.append(x.split("\0", 1)[0])
+                if "\0" in x:
+                    break
+            return "".join(chars).rstrip()
         elif len(a.shape) == 2:
             return np.array([stringify(row) for row in a])
         elif len(a.shape) == 3:
@@ -33,15 +43,16 @@ def stringify(a):
 def _stringify_chars(a):
     """Fast path of :func:`stringify` for 1D/2D netCDF char (``S1``) arrays.
 
-    Same result as joining the characters of each row with NUL bytes removed
-    and trailing whitespace stripped, but without a Python loop per character.
+    Each row ends at its first NUL byte (like the Exodus library: bytes after
+    it are left over from a longer name written before) and trailing
+    whitespace is stripped, without a Python loop per character.
     """
     n = a.shape[-1]
     if n == 0:
         return "" if a.ndim == 1 else np.array([""] * a.shape[0])
     rows = np.ascontiguousarray(a).view(f"S{n}").reshape(a.shape[:-1])
     strings = [
-        row.replace(b"\0", b"").decode("utf-8", "replace").rstrip()
+        row.split(b"\0", 1)[0].decode("utf-8", "replace").rstrip()
         for row in rows.reshape(-1).tolist()
     ]
     return strings[0] if a.ndim == 1 else np.array(strings)
@@ -50,6 +61,8 @@ def _stringify_chars(a):
 def decode(x):
     if isinstance(x, np.ma.core.MaskedConstant):
         return ""
+    if isinstance(x, str):
+        return x
     return x.decode()
 
 

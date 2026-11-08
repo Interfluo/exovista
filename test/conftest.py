@@ -25,3 +25,18 @@ def datafile(datadir):
         return path
 
     return _resolve
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "requires_pyvista(version, what): skip on PyVista older than version "
+        "(what names the test oracle or helper that needs it)",
+    )
+
+
+def pytest_runtest_setup(item):
+    from _pvcompat import requires_pyvista
+
+    for marker in item.iter_markers(name="requires_pyvista"):
+        requires_pyvista(*marker.args)

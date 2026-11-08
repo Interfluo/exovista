@@ -46,17 +46,22 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Visualization",
     "Typing :: Typed",
 ]
-# Lower bounds: the oldest releases the full test suite passes with, verified
-# together on Python 3.10 (the "oldest-deps" CI job installs exactly these).
-# numpy 1.21.3, scipy 1.7.2 and netCDF4 1.5.8 are also the oldest releases with
-# Python 3.10 wheels.  PyVista 0.49 is the first release the suite's VTK oracles
-# run on (pv.PExodusIIReader, mesh validation); mesh.save("x.exo") needs the
-# pyvista.writers registry of PyVista >= 0.48.  No upper caps.
+# Lower bounds: the oldest releases exovista works with, verified together on
+# Python 3.10 (the "oldest-deps" CI job installs exactly these, with VTK < 9.4:
+# PyVista < 0.44 does not work with VTK >= 9.4).  numpy 1.21.3, scipy 1.7.2 and
+# netCDF4 1.5.8 are also the oldest releases with Python 3.10 wheels.  PyVista
+# 0.42 is the first release with pyvista.CellArray.from_arrays, which
+# read_exo/write_exo use.  Newer PyVista adds features, not requirements:
+# mesh.save("x.exo") needs the pyvista.writers registry of PyVista >= 0.48,
+# extract_surface(algorithm=None) (used in the README and examples) 0.47, and
+# the README's write-back of pv.ExodusIIReader output with node sets 0.49.
+# Tests whose oracles or helpers need a newer PyVista skip on older ones.
+# No upper caps.
 dependencies = [
     "numpy>=1.21.3",
     "scipy>=1.7.2",
     "netCDF4>=1.5.8",
-    "pyvista>=0.49",
+    "pyvista>=0.42",
 ]
 
 [project.optional-dependencies]

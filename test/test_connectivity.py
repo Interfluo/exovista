@@ -7,8 +7,8 @@ order differs between VTK and Exodus must be permuted on write.
 import netCDF4
 import numpy as np
 import pyvista as pv
-from pyvista.examples import cells as example_cells
 
+from _pvcompat import example_cell
 from exovista.write_pyvista import write_exo
 
 
@@ -48,7 +48,7 @@ def test_pixel_connectivity(tmp_path):
 
 def test_hex20_connectivity(tmp_path):
     # Exodus lists the 4 vertical mid-edge nodes before the 4 top ones
-    grid = example_cells.QuadraticHexahedron()
+    grid = example_cell("QuadraticHexahedron")
     write_exo(tmp_path / "hex20.exo", grid)
     conn, elem_type, _ = _connect1(tmp_path / "hex20.exo")
     vtk_order = np.arange(20)

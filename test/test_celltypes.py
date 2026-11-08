@@ -13,8 +13,8 @@ exactly and comparisons can be exact.
 import numpy as np
 import pytest
 import pyvista as pv
-from pyvista.examples import cells as example_cells
 
+from _pvcompat import example_cell, exodus_reader, vtk_measures
 from exovista import _celltypes as ct
 from exovista._backend import open_reader, write_model
 from exovista._model import Block, ExodusModel, SideSet
@@ -64,7 +64,7 @@ _WRITE_CASES = [
 
 def _reference_points(vtk_type, num_dim):
     """Points of one valid cell of ``vtk_type`` (VTK order), on a 1/64 grid."""
-    cell = getattr(example_cells, _EXAMPLES[vtk_type])()
+    cell = example_cell(_EXAMPLES[vtk_type])
     pts = np.round(np.asarray(cell.points, dtype=float) * 64) / 64
     n = pts.shape[0]
     assert len(np.unique(pts, axis=0)) == n
@@ -89,7 +89,7 @@ def _two_cell_mesh(vtk_type, num_dim):
 
 
 def _oracle_grid(path):
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     return reader.read()["Element Blocks"][0]
 
 
@@ -131,7 +131,7 @@ def test_permutation_matches_vtk_reader(tmp_path, vtk_type, num_dim):
     if size is not None and (info.dim == 3 or num_dim == 2):
         source = pv.UnstructuredGrid({vtk_type: conn}, points)
         expected = source.compute_cell_sizes()[size]
-        assert np.all(expected > 0)
+        assert np.all(expected > 0) or not vtk_measures(vtk_type)
         np.testing.assert_allclose(grid.compute_cell_sizes()[size], expected)
 
     # and back through exovista's own reader
@@ -243,7 +243,7 @@ def test_side_table_matches_vtk_reader(tmp_path, exo_name, num_dim):
     path = tmp_path / "sides.exo"
     write_model(path, model)
 
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.side_sets.enable_all()
     sets = reader.read()["Side Sets"]
     corners = pts[econn[0, : info.n_corners]]

@@ -10,8 +10,8 @@ import warnings
 import numpy as np
 import pytest
 import pyvista as pv
-from pyvista.examples import cells as example_cells
 
+from _pvcompat import example_cell, exodus_reader, validate_mesh
 from exovista import _celltypes as ct
 from exovista import read_pyvista as rp
 from exovista._backend import write_model
@@ -92,7 +92,7 @@ _QUADRATIC_ALIASES = [("HEX", 20), ("HEXAHEDRON", 27), ("TETRA", 10),
 
 def _reference_points(vtk_type, num_dim):
     """Points of one valid cell (VTK order) on a 1/64 grid."""
-    cell = getattr(example_cells, _EXAMPLES[vtk_type])()
+    cell = example_cell(_EXAMPLES[vtk_type])
     pts = np.round(np.asarray(cell.points, dtype=float) * 64) / 64
     assert len(np.unique(pts, axis=0)) == len(pts)
     if num_dim == 2:
@@ -144,9 +144,10 @@ def _check_cells(path, info, points, vtk_conn, num_dim, oracle=True):
     np.testing.assert_array_equal(grid.points, expected_points)
     for i in range(2):
         assert list(grid.get_cell(i).point_ids) == list(vtk_conn[i])
-    report = grid.validate_mesh(
+    report = validate_mesh(
+        grid,
         ["wrong_number_of_points", "invalid_point_references", "negative_size",
-         "inverted_faces", "non_finite_points"]
+         "inverted_faces", "non_finite_points"],
     )
     assert report.is_valid, report.message
     if info.dim > 0:
@@ -163,7 +164,7 @@ def _check_cells(path, info, points, vtk_conn, num_dim, oracle=True):
         assert np.all(expected > 0)
         np.testing.assert_allclose(sizes, expected)
     if oracle:
-        vtk_grid = pv.ExodusIIReader(str(path)).read()["Element Blocks"][0]
+        vtk_grid = exodus_reader(str(path)).read()["Element Blocks"][0]
         assert list(vtk_grid.celltypes) == list(grid.celltypes)
         for i in range(2):
             np.testing.assert_array_equal(
@@ -213,7 +214,7 @@ def test_voxel_and_pixel_inputs(tmp_path):
                 ExodusModel("vox", 3, vol.points, [Block(1, "v", "HEX8", exo)]))
     grid = rp.read_exo(tmp_path / "vox.exo")
     assert set(grid.celltypes) == {VTK.HEXAHEDRON}
-    assert grid.validate_mesh().is_valid
+    assert validate_mesh(grid).is_valid
     np.testing.assert_allclose(grid.compute_cell_sizes()["Volume"], 0.5 * 0.25 * 0.125)
 
 
@@ -261,10 +262,10 @@ def test_mixed_types_and_original_order(tmp_path, original_order):
         vtk_type, row = expected[file_index]
         assert grid.celltypes[cell] == vtk_type
         assert list(grid.get_cell(cell).point_ids) == list(row)
-    assert grid.validate_mesh().is_valid
+    assert validate_mesh(grid).is_valid
 
     # VTK's reader agrees cell by cell (it reports the id map as GlobalElementId)
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.reader.GenerateGlobalElementIdArrayOn()
     blocks = reader.read()["Element Blocks"]
     by_id = {}

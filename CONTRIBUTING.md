@@ -78,6 +78,15 @@ writer feature is checked against an **independent reader**:
   Sandia tools, serial and parallel) and against files written by VTK and
   meshio, as well as on exovista's own output.
 
+The oracles need a newer PyVista than exovista itself (which supports
+PyVista >= 0.42): `pv.ExodusIIReader` (0.45), `validate_mesh` (0.48), the
+quadratic cells of `pyvista.examples.cells` (0.45), ... Reach them through
+the wrappers in `test/_pvcompat.py` (`exodus_reader`, `validate_mesh`,
+`example_cell`, `extract_surface`, `requires_pyvista`): on an older PyVista
+the test is skipped with a reason that names the missing feature, while tests
+of exovista's own behaviour keep running. The CI job "Oldest supported
+dependencies" runs the suite with the lower bounds of `pyproject.toml`.
+
 When you add a feature or fix a bug, add a test that would fail without the
 change, and when it concerns the file contents, check them with VTK's reader
 or netCDF4 rather than only with `read_exo`.

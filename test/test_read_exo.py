@@ -15,6 +15,7 @@ import pytest
 import pyvista as pv
 
 import exovista
+from _pvcompat import exodus_reader
 from exovista import _celltypes as ct
 from exovista import read_pyvista as rp
 from exovista._backend import write_model
@@ -403,8 +404,9 @@ def test_combine_components(tmp_path):
     assert np.isnan(s[0, 2])
     np.testing.assert_array_equal(s[1:, 2], model.elem_vars["s_Z"][2][0])
     np.testing.assert_array_equal(grid.cell_data["p"][1:], [np.nan, np.nan])
-    # global variables are never combined
-    np.testing.assert_array_equal(grid.field_data["g_X"], [1.0])
+    # global variables are combined like the others: one tuple at the step
+    np.testing.assert_array_equal(grid.field_data["g"], [[1.0, 3.0]])
+    assert "g_X" not in grid.field_data.keys()
 
 
 def test_combined_vector_matches_vtk_reader(tmp_path):
@@ -417,7 +419,7 @@ def test_combined_vector_matches_vtk_reader(tmp_path):
                         node_vars=node_vars)
     path = tmp_path / "vel.exo"
     write_model(path, model)
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.enable_all_point_arrays()
     reader.reader.SetSqueezePoints(False)
     reader.set_active_time_point(1)
@@ -460,8 +462,10 @@ def test_variable_selection(tmp_path):
         rp.read_exo(path, read_node_variables=["T", "nope"])
     with pytest.raises(KeyError):
         rp.read_exo(path, read_element_variables="vel")  # a node variable
+    grid = rp.read_exo(path, read_global_variables="g")  # combined global
+    assert grid.field_data["g"].shape == (1, 2)
     with pytest.raises(KeyError):
-        rp.read_exo(path, read_global_variables="g")  # globals stay scalar
+        rp.read_exo(path, read_global_variables="g", combine_components=False)
     with pytest.raises(KeyError):  # combined names exist only when combining
         rp.read_exo(path, read_node_variables="vel", combine_components=False)
 

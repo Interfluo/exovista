@@ -48,6 +48,7 @@ def main():
     # 1. VTK's reader: scale the model from m to mm.
     reader = pv.ExodusIIReader("example_read_back_input.exo")
     reader.node_sets.enable_all()  # pv.read loads side sets, not node sets
+    reader.reader.GenerateGlobalNodeIdArrayOn()  # keep the file's nodes apart
     data = reader.read()
     for name in ("Element Blocks", "Side Sets", "Node Sets"):
         for block in data[name]:

@@ -71,6 +71,11 @@ def _coords_from_file(fh, num_dim):
     and the combined ``coord`` ``(num_dim, num_nodes)`` variable (written by
     older Exodus versions and by meshio).
     """
+    if not num_dim:
+        raise ValueError(
+            f"{nc.filename(fh)}: not an ExodusII file (no {ex.DIM_NUM_DIM!r} "
+            "dimension)"
+        )
     names = (ex.VAR_COORD_X, ex.VAR_COORD_Y, ex.VAR_COORD_Z)[:num_dim]
     if all(name in fh.variables for name in names):
         return np.column_stack([nc.get_variable(fh, name) for name in names])
@@ -225,7 +230,9 @@ class exodusii_file:
         return self
 
     def __exit__(self, type, value, traceback):
-        self.close()
+        # A file being written is complete only once its close() (the HDF5
+        # flush) succeeded: report errors there unless another one is raised.
+        self.close(strict=type is None and getattr(self, "mode", "r") in ("w", "a"))
 
     @property
     def fh(self):
@@ -243,9 +250,12 @@ class exodusii_file:
     def open(self, filename, mode="r"):
         return self._open(filename, mode)
 
-    def close(self):
-        """Close the underlying netCDF file(s); safe to call more than once."""
-        return nc.close(*getattr(self, "files", []))
+    def close(self, strict=False):
+        """Close the underlying netCDF file(s); safe to call more than once.
+
+        Errors while closing are ignored unless ``strict`` is true.
+        """
+        return nc.close(*getattr(self, "files", []), strict=strict)
 
     def is_edge_variable(self, variable):
         variables = self.get_edge_variable_names()
@@ -2775,7 +2785,8 @@ class exodusii_file:
 
     @requires_write_mode
     def initw(self):
-        version = 5.0300002
+        # NC_FLOAT, as the Exodus library writes them
+        version = np.float32(5.03)
         self.setattr(ex.ATT_API_VERSION, version)
         self.setattr(ex.ATT_VERSION, version)
         self.setattr(ex.ATT_FLT_WORDSIZE, self.float_word_size)

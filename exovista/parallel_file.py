@@ -75,9 +75,9 @@ class parallel_exodusii_file(exodusii_file):
 
         return self.files
 
-    def close(self):
+    def close(self, strict=False):
         """Close every constituent file; safe to call more than once."""
-        nc.close(*self.files)
+        nc.close(*self.files, strict=strict)
 
     def write(self, filename):
         """Write the parallel Exodus file to a single file"""
@@ -985,12 +985,19 @@ class parallel_exodusii_file(exodusii_file):
             shape = (self.num_nodes(),)
         values = np.zeros(shape, dtype=float)
         node_index, _ = self._node_index()
+        found = False
         for (fid, file) in enumerate(self.files):
             local = self.get_variable(file, ex.VAR_NODE_VAR(var_iid), index=index)
             if local is None:
+                # "normal model" parts: one (time_step, num_nod_var, num_nodes)
+                local = self.get_variable(
+                    file, ex.VAR_NODE_VAR_COMBINED, index=(index, var_iid - 1)
+                )
+            if local is None:
                 continue
+            found = True
             values[..., node_index[fid]] = local
-        return values
+        return values if found else None
 
     def get_qa_records(self):
         """Get a list of QA records where each QA record is a length-4 tuple of

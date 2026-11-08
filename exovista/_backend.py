@@ -15,6 +15,7 @@ Public entry points
 
 from __future__ import annotations
 
+import errno
 import glob
 import os
 import stat
@@ -79,9 +80,15 @@ def write_model(
     is unlimited only when there are no steps): reading a netCDF-4 file with
     an unlimited dimension costs a scan of every variable per variable read.
     The file can therefore not be extended with more time steps in place.
+    Compressed time-dependent variables get one time step per chunk, so that
+    reading one step decompresses only that step.
 
     If ``filename`` is a symbolic link, the file it points to is replaced
-    (the link is kept); an existing file keeps its permission bits.
+    (the link is kept); an existing file keeps its permission bits. An
+    existing file that is not writable is not replaced: ``PermissionError``
+    is raised (as ``open(filename, "w")`` would), although replacing it by a
+    rename would be allowed. Errors raised while the file is closed (when
+    HDF5 writes deferred data) are raised too, before anything is replaced.
     """
     if not isinstance(model, ExodusModel):
         raise TypeError(f"expected an ExodusModel, got {type(model).__name__}")
@@ -100,6 +107,13 @@ def write_model(
     directory = os.path.dirname(target)
     if not os.path.isdir(directory):
         raise FileNotFoundError(f"directory does not exist: {directory}")
+    if os.path.exists(target) and not os.access(target, os.W_OK):
+        # Replacing it by a rename would succeed where open(target, "w")
+        # fails: refuse, like open() (and exovista 1.x) do.
+        raise PermissionError(
+            errno.EACCES, "Permission denied (the file is not writable)",
+            os.fspath(filename),
+        )
     # A short temporary name: "<target name>.<hex>.tmp" would exceed NAME_MAX
     # for long (but valid) target names.
     tmp = os.path.join(directory, f".exovista-{uuid.uuid4().hex[:16]}.tmp")
@@ -120,11 +134,22 @@ def write_model(
             pass
         os.replace(tmp, target)
     except BaseException:
+        _remove_quietly(tmp)
+        raise
+
+
+def _remove_quietly(path: str) -> None:
+    """Remove ``path`` if it exists, even when it is read-only (Windows)."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
         try:
-            os.remove(tmp)
+            os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+            os.remove(path)
         except OSError:
             pass
-        raise
 
 
 def _finite_max_abs(values: np.ndarray) -> float:
@@ -667,7 +692,18 @@ class ExodusReader:
             values = self._f.node_variable_values_by_index(iid, index)
         else:
             values = self._f.get_variable(ex.VAR_NODE_VAR(iid), index=index)
+            if values is None:
+                # "normal model" files store every nodal variable in one
+                # (time_step, num_nod_var, num_nodes) variable
+                values = self._f.get_variable(
+                    ex.VAR_NODE_VAR_COMBINED, index=(index, iid - 1)
+                )
         if values is None:
+            warnings.warn(
+                f"nodal variable {name!r} has no stored values; it reads as NaN",
+                UserWarning,
+                stacklevel=2,
+            )
             shape = (self.num_nodes,) if step is not None else (
                 self.num_steps, self.num_nodes)
             return np.full(shape, np.nan)
@@ -769,6 +805,12 @@ def open_reader(filename: str | os.PathLike, *files: str) -> Iterator[ExodusRead
     else:
         handle = exodusii_file(paths[0], mode="r")
     try:
+        for fh in handle.files:
+            if ex.DIM_NUM_DIM not in fh.dimensions:
+                raise ValueError(
+                    f"{fh.filepath()}: not an ExodusII file (no "
+                    f"{ex.DIM_NUM_DIM!r} dimension)"
+                )
         yield ExodusReader(handle)
     finally:
         handle.close()

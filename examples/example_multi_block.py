@@ -22,20 +22,20 @@ def main():
     exovista.write_exo(filename, grid,
                        block_names=["left_material", "right_material"])
     mesh = exovista.read_exo(filename)
-    print("region array :", sorted(set(mesh.cell_data["exo_block_name"])))
+    print("region array :", np.unique(mesh.cell_data["exo_block_name"]).tolist())
 
     # a MultiBlock: each leaf becomes a block named after its key
     left = grid.extract_cells(np.flatnonzero(grid.cell_data["region"] == 1))
     right = grid.extract_cells(np.flatnonzero(grid.cell_data["region"] == 2))
     exovista.write_exo(filename, pv.MultiBlock({"left": left, "right": right}))
     mesh = exovista.read_exo(filename)
-    print("MultiBlock   :", sorted(set(mesh.cell_data["exo_block_name"])))
+    print("MultiBlock   :", np.unique(mesh.cell_data["exo_block_name"]).tolist())
 
     # string region values name the blocks directly
     grid.cell_data["region"] = np.where(centers[:, 0] > 2, "aluminium", "copper")
     exovista.write_exo(filename, grid)
     mesh = exovista.read_exo(filename)
-    print("string region:", sorted(set(mesh.cell_data["exo_block_name"])))
+    print("string region:", np.unique(mesh.cell_data["exo_block_name"]).tolist())
 
 
 if __name__ == "__main__":

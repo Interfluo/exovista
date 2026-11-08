@@ -346,6 +346,9 @@ DIM_NUM_NODE_VAR = "num_nod_var"  # number of nodal variables
 VAR_NAME_NODE_VAR = "name_nod_var"  # names of nodal variables
 
 VAR_NODE_VAR = lambda num: ex_catstr("vals_nod_var", num)  # values of nodal variables
+# all nodal variables in one (time_step, num_nod_var, num_nodes) variable
+# ("normal model" files, file_size = 0)
+VAR_NODE_VAR_COMBINED = "vals_nod_var"
 
 DIM_NUM_ELEM_VAR = "num_elem_var"  # number of element variables
 VAR_NAME_ELEM_VAR = "name_elem_var"  # names of element variables

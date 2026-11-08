@@ -18,6 +18,7 @@ import pytest
 import pyvista as pv
 
 import exovista
+from _pvcompat import exodus_reader
 from exovista import _backend, nc
 from exovista._backend import open_reader, read_model, write_model
 from exovista._model import Block, ExodusModel, NodeSet, SideSet, component_suffixes
@@ -169,7 +170,7 @@ def test_vtk_oracle_reads_backend_file(tmp_path):
     model = _hex_tet_model()
     path = str(tmp_path / "oracle.exo")
     write_model(path, model)
-    reader = pv.ExodusIIReader(path)
+    reader = exodus_reader(path)
     assert reader.element_blocks.names == [LONG, "tets"]
     assert reader.side_sets.names[0] == "left" + "_x" * 30
     assert reader.node_sets.names == ["bottom", "n" * 100]
@@ -268,7 +269,7 @@ def test_2d_model(tmp_path):
     back = read_model(path)
     _assert_models_equal(model, back)
     assert back.coords.shape == (5, 2)
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.reader.SetSqueezePoints(False)
     reader.enable_all_point_arrays()
     blocks = reader.read()["Element Blocks"]
@@ -302,7 +303,7 @@ def test_empty_sets_and_null_block(tmp_path):
         assert [(s.id, s.name, len(s.elems)) for s in r.side_sets()] == [(5, "none", 0)]
         assert [(s.id, s.name, len(s.nodes)) for s in r.node_sets()] == [(6, "none", 0)]
         assert r.elem_var("e", 2) is None
-    grid = pv.ExodusIIReader(str(path)).read()["Element Blocks"]
+    grid = exodus_reader(str(path)).read()["Element Blocks"]
     assert grid[0].n_cells == 1
 
 
@@ -443,7 +444,7 @@ def test_non_ascii_names_roundtrip(tmp_path):
         # readers size their name buffers from this attribute: bytes
         assert ds.maximum_name_length == len(names["block"].encode("utf-8")) == 47
 
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     assert reader.element_blocks.names[0] == names["block"]
     assert reader.side_sets.names == [names["side_set"]]
     assert reader.node_sets.names == [names["node_set"]]

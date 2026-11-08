@@ -14,8 +14,8 @@ import warnings
 import numpy as np
 import pytest
 import pyvista as pv
-from pyvista.examples import cells as example_cells
 
+from _pvcompat import example_cell, exodus_reader, flip_faces
 from exovista._backend import open_reader
 from exovista.write_pyvista import write_exo
 
@@ -30,7 +30,7 @@ _N_CORNERS = {
 # helpers
 # --------------------------------------------------------------------------- #
 def vtk_side_sets(path):
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.side_sets.enable_all()
     reader.reader.GenerateGlobalElementIdArrayOn()
     return reader.read()["Side Sets"]
@@ -163,11 +163,11 @@ _SOLIDS = {
     "wedge": wedge_grid,
     "pyramid": pyramid_grid,
     "mixed": mixed_grid,
-    "tet10": lambda: example_cells.QuadraticTetrahedron(),
-    "hex20": lambda: example_cells.QuadraticHexahedron(),
-    "hex27": lambda: example_cells.TriQuadraticHexahedron(),
-    "wedge15": lambda: example_cells.QuadraticWedge(),
-    "pyramid13": lambda: example_cells.QuadraticPyramid(),
+    "tet10": lambda: example_cell("QuadraticTetrahedron"),
+    "hex20": lambda: example_cell("QuadraticHexahedron"),
+    "hex27": lambda: example_cell("TriQuadraticHexahedron"),
+    "wedge15": lambda: example_cell("QuadraticWedge"),
+    "pyramid13": lambda: example_cell("QuadraticPyramid"),
 }
 
 
@@ -203,7 +203,7 @@ def test_quadratic_surface_cells_match_by_corners(tmp_path, name):
 
 def test_inward_oriented_boundary_faces_still_match(tmp_path):
     grid = hex_grid()
-    surface = extract_surface(grid).flip_faces()
+    surface = flip_faces(extract_surface(grid))
     write_exo(tmp_path / "in.exo", grid, surface)
     (vtk_set,) = vtk_side_sets(tmp_path / "in.exo")
     assert_side_set(vtk_set, surface, surface.cell_data["vtkOriginalCellIds"])
@@ -216,7 +216,7 @@ def test_surface_cell_kinds(tmp_path):
     pts = np.asarray(grid.points)
     bottom = np.flatnonzero(pts[:, 2] == 0)
     order = bottom[np.argsort(np.arctan2(pts[bottom, 1] - 0.5, pts[bottom, 0] - 0.5))]
-    poly = make_grid({CT.POLYGON: [order]}, pts)
+    poly = pv.UnstructuredGrid(np.r_[4, order], [CT.POLYGON], pts)
     assert poly.celltypes[0] == CT.POLYGON  # a genuine 4-point VTK_POLYGON
     write_exo(tmp_path / "poly.exo", grid, poly)
     assert file_side_sets(tmp_path / "poly.exo") == [(1, "side_set_1", 1)]
@@ -264,7 +264,7 @@ def test_flipped_interface_faces_change_owner(tmp_path):
     (vtk_set,) = vtk_side_sets(tmp_path / "a.exo")
     assert set(grid.cell_data["region"][vtk_set.cell_data["SourceElementId"]]) == {1}
 
-    write_exo(tmp_path / "b.exo", grid, faces.flip_faces())
+    write_exo(tmp_path / "b.exo", grid, flip_faces(faces))
     (vtk_set,) = vtk_side_sets(tmp_path / "b.exo")
     assert set(grid.cell_data["region"][vtk_set.cell_data["SourceElementId"]]) == {2}
     assert corner_sets(vtk_set) == corner_sets(faces)
@@ -308,10 +308,12 @@ def test_side_set_ids_from_integer_regions(tmp_path):
     ]
     sets = vtk_side_sets(tmp_path / "i.exo")
     assert sets.keys() == ["side_set_5", "side_set_9"]
+    # a copy: extract_cells overwrites the input's array in PyVista 0.45, 0.46
+    owners = np.array(surface["vtkOriginalCellIds"])
     for set_id, vtk_set in zip((5, 9), sets):
         members = np.flatnonzero(surface["region"] == set_id)
         part = surface.extract_cells(members)
-        assert_side_set(vtk_set, part, surface["vtkOriginalCellIds"][members])
+        assert_side_set(vtk_set, part, owners[members])
 
 
 def test_side_set_names_and_string_regions(tmp_path):
@@ -329,8 +331,20 @@ def test_side_set_names_and_string_regions(tmp_path):
     assert file_side_sets(tmp_path / "n.exo") == [
         (1, "side_set_1", 8), (2, "side_set_2", 16)
     ]
-    write_exo(tmp_path / "k.exo", grid, surface, region_key="other")  # absent
+    with pytest.raises(KeyError, match="'other' is not a cell array"):
+        write_exo(tmp_path / "k.exo", grid, surface, region_key="other")  # absent
+    # a key on the volume only: one side set
+    grid.cell_data["other"] = np.ones(grid.n_cells, int)
+    write_exo(tmp_path / "k.exo", grid, surface, region_key="other")
     assert file_side_sets(tmp_path / "k.exo") == [(1, "side_set_1", 24)]
+    # a key on the surface only: one element block, one side set per value
+    del grid.cell_data["other"]
+    surface = surface.copy()
+    surface.cell_data["other"] = surface.cell_data["region"]
+    write_exo(tmp_path / "k2.exo", grid, surface, region_key="other")
+    assert file_side_sets(tmp_path / "k2.exo") == [
+        (1, "side_set_1", 8), (2, "side_set_2", 16)
+    ]
 
     for names, match in ((["a"], "1 name"), (["a", "a"], "unique"),
                          ({5: "x"}, "not a region value")):
@@ -342,7 +356,7 @@ def test_side_set_names_and_string_regions(tmp_path):
 def test_duplicate_faces_are_dropped_once(tmp_path):
     grid = hex_grid(1, 1, 1)
     surface = extract_surface(grid)
-    doubled = pv.merge([surface, surface.flip_faces(), surface], merge_points=True)
+    doubled = pv.merge([surface, flip_faces(surface), surface], merge_points=True)
     with pytest.warns(UserWarning, match="repeated") as record:
         write_exo(tmp_path / "dup.exo", grid, doubled)
     assert len([w for w in record if "repeated" in str(w.message)]) == 1

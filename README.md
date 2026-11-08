@@ -71,9 +71,10 @@ and whole time histories as plain PyVista and NumPy objects.
 - **Element blocks** from any integer or string cell array (`region` by
   default) or from the leaves of a `pv.MultiBlock`; integer region values
   become block ids, blocks are named (`"block_<id>"` by default).
-- **Side sets** from a boundary surface (`mesh.extract_surface()`, or any
-  subset of it), matched topologically to element sides, with a documented
-  rule for faces on internal interfaces.
+- **Side sets** from a boundary surface
+  (`mesh.extract_surface(algorithm=None)`, or any subset of it), matched
+  topologically to element sides, with a documented rule for faces on
+  internal interfaces.
 - **Node sets** from index arrays or boolean masks.
 - **Variables**: point and cell arrays, time histories
   (`node_fields`, `element_fields`), global variables; vectors are split into
@@ -82,17 +83,20 @@ and whole time histories as plain PyVista and NumPy objects.
 - **Element types**: linear and quadratic tetrahedra, hexahedra, wedges and
   pyramids, triangles and quadrilaterals (planar or shells), bars and
   spheres — every node ordering checked against VTK's own Exodus reader.
-- **2D meshes** are written as true `num_dim = 2` files automatically.
+- **2D meshes** are written as true `num_dim = 2` files automatically
+  (x and y only: a flat mesh at a z other than 0 comes back at z = 0, with a
+  warning when it is written; `num_dim=3` keeps z).
 - **Precision and size**: float64 by default (`precision="single"` for
   float32), zlib-compressed netCDF-4 output, atomic writes (no half-written
   file on error).
 - **Reading back**: `read_exo` restores the written mesh exactly (points,
-  cell order, blocks, variables), recombines vector and tensor components, and
+  cell order, blocks, variables; z of 2D files is 0), recombines vector and
+  tensor components, and
   joins parallel decompositions (`model.exo.4.0` ... `model.exo.4.3`) into one
   mesh with global numbering. Side sets, node sets and full time histories
   have their own functions.
 - **PyVista integration**: installing exovista registers a `pyvista.writers`
-  plugin, so `mesh.save("model.exo")` works.
+  plugin, so `mesh.save("model.exo")` works (PyVista >= 0.48).
 
 ## How it compares
 
@@ -145,9 +149,21 @@ pip install exovista
 ```
 
 exovista needs Python >= 3.10 (tested on 3.10 to 3.14) and installs
-NumPy >= 1.21.3, SciPy >= 1.7.2, netCDF4 >= 1.5.8 and PyVista >= 0.49 (which
+NumPy >= 1.21.3, SciPy >= 1.7.2, netCDF4 >= 1.5.8 and PyVista >= 0.42 (which
 brings VTK). It is not on conda-forge yet; inside a conda environment,
 install the dependencies with conda and exovista with pip.
+
+`write_exo`, `read_exo` and the other functions work with every PyVista from
+0.42 on (PyVista 0.42 and 0.43 need VTK < 9.4); newer PyVista adds
+conveniences around them:
+
+- `mesh.save("model.exo")` (the plugin) needs PyVista >= 0.48; with older
+  PyVista call `exovista.write_exo("model.exo", mesh)`.
+- The snippets below are written for current PyVista: they use
+  `extract_surface(algorithm=None)` (PyVista >= 0.47; before that, call
+  `extract_surface()`, whose faces of linear wedges point inward, see
+  [side sets](#side-sets)) and write back `pv.ExodusIIReader` output with its
+  side and node sets (PyVista >= 0.49 reads both together).
 
 For development:
 
@@ -197,9 +213,11 @@ arguments go to `write_exo`):
 mesh.save("saved.exo", surface=surface, block_names={1: "copper", 2: "steel"})
 ```
 
-The plugin handles `.exo`, `.e`, `.ex2`, `.exii` and `.gen`. `mesh.save` keeps
-its own `binary`, `texture` and `compression` arguments; exovista's
-compression setting is `compression_level`.
+The plugin handles `.exo`, `.e`, `.ex2`, `.exii` and `.gen` (PyVista >= 0.48).
+`mesh.save` keeps its own `binary`, `texture` and `compression` arguments;
+exovista's compression setting is `compression_level`. PyVista's `pv.read`
+does not recognise `.gen`: read such a file with `exovista.read_exo`,
+`pv.ExodusIIReader(path)` or `pv.read(path, force_ext=".exo")`.
 
 Read it back:
 
@@ -215,8 +233,9 @@ print(exovista.read_node_sets("model.exo"))           # {'corner': array([0])}
 ```
 
 `read_exo` returns the mesh as it was written: same points (float64, same
-order), same cells in the same order, plus `exo_block_id`, `exo_block_name`
-and `exo_elem_id` cell arrays.
+order; a flat mesh written as a 2D file has z = 0, see
+[2D meshes](#2d-meshes)), same cells in the same order, plus `exo_block_id`,
+`exo_block_name` and `exo_elem_id` cell arrays.
 
 Use **`pv.read("model.exo")`** (VTK's reader) instead when you want
 ParaView's view of a file: one grid per block, edge and face blocks, element
@@ -254,7 +273,10 @@ More in [`examples/`](https://github.com/bijective-systems-org/exovista/tree/mai
 An Exodus element block holds elements of one type. `write_exo` groups cells
 by **(region, element type)**, where the region is the value of the cell array
 named by `region_key` (`"region"` by default; integer or string values).
-Without that array the whole mesh is one region.
+Without that array the whole mesh is one region (only for the default name:
+a `region_key` you pass must name a cell array of the volume or of the
+surface, so that a misspelt name raises `KeyError` instead of merging all
+regions into one block).
 
 - **Ids.** If every region value is an integer >= 1 and each region has a
   single element type, the block id is the region value. Otherwise blocks are
@@ -392,8 +414,11 @@ print({name: len(ids) for name, ids in exovista.read_node_sets("sets.exo").items
   is allowed. For a single step, `(n_points,)` / `(n_cells,)` arrays are
   accepted. Without `times`, variables are written at one step, t = 0.0. A
   time-varying field replaces a static array of the same name.
-- **Components**: multi-component arrays are split into scalar variables with
-  these suffixes, which `read_exo` recombines (`combine_components=True`).
+- **Components**: multi-component arrays (node, element and global) are
+  split into scalar variables with these suffixes, which `read_exo`
+  recombines (`combine_components=True`; a recombined global variable is a
+  `(1, n_components)` array in `field_data`, and `read_global_fields(...,
+  combine_components=True)` gives `(n_steps, n_components)`).
   VTK's reader regroups the `_X/_Y/_Z` vectors (as `name_`) but not the
   tensors (a 9-component tensor shows up there as three vectors
   `name_X`, `name_Y`, `name_Z`).
@@ -429,7 +454,9 @@ exovista.write_exo(
 
 `write_exo` writes the whole history at once, and the `time_step` dimension
 of the file has a fixed length, so more steps cannot be appended to the file
-later (see [Limitations](#limitations)).
+later (see [Limitations](#limitations)). Each time-dependent variable is
+compressed one step per chunk, so reading one step (in exovista, VTK or
+ParaView) decompresses only that step.
 
 ### 2D meshes
 
@@ -438,6 +465,15 @@ share one z coordinate is written as a planar `num_dim = 2` file: `TRI*` and
 `QUAD*` elements, x and y coordinates only, and side sets made of element
 edges (pass line cells as `surface`). Pass `num_dim=3` to keep z; 2D cells are
 then written as shells.
+
+A 2D file stores no z: a flat mesh at another z than 0 (a slice at z = 1.5,
+`pv.Plane(center=(0, 0, 5))`) reads back at z = 0. `write_exo` warns when the
+automatic choice drops a z other than 0; pass `num_dim=3` to keep it, or
+`num_dim=2` to accept it. A grid from `read_exo` of a 3D file
+(`field_data["num_dim"]` is 3) is written as a 3D file again, so a planar
+shell model stays a shell model. VTK's reader output does not record the
+dimension of the file it read: writing it back flat warns unless `num_dim`
+is given.
 
 ```python
 plate = pv.Plane(i_resolution=4, j_resolution=2).cast_to_unstructured_grid()
@@ -549,6 +585,7 @@ with a warning.
 ```python
 reader = pv.ExodusIIReader("model.exo")
 reader.node_sets.enable_all()          # pv.read loads side sets, not node sets
+reader.reader.GenerateGlobalNodeIdArrayOn()  # keep the file's nodes apart
 data = reader.read()
 for block in data["Element Blocks"]:
     block.point_data["temperature"] += 1.0
@@ -558,16 +595,29 @@ print(copy.keys(), exovista.read_node_sets("model_copy.exo"))
 # ['inlet', 'outlet'] {'corner': array([0])}
 ```
 
-Notes: VTK's reader moves the points by displacement variables (`DISPL*`)
-unless you call `reader.disable_displacements()`; its nodes are merged by
-`GlobalNodeId` when present (`reader.reader.GenerateGlobalNodeIdArrayOn()`),
-otherwise by coordinates; only the reader's active time step is in the
-`MultiBlock`, so pass `times=[reader.active_time_value]` to keep its time
-value.
+Notes:
+
+- **Nodes**: VTK's reader gives every block its own copy of the nodes it
+  uses. `write_exo` joins them by `GlobalNodeId` when present, otherwise by
+  coordinates, which also joins distinct nodes at the same place (contact
+  surfaces, cracks). Call `reader.reader.GenerateGlobalNodeIdArrayOn()`
+  before `read()` (as above) to keep them apart (`pv.read` cannot); without
+  it, `write_exo` warns when point values differ between joined nodes, or
+  when nodes of one block are joined.
+- **Dimension**: a flat model is written as a 2D file with a warning, since
+  VTK's output does not say whether the file was 2D; pass `num_dim=3` for a
+  planar shell model (`num_dim=2` for a 2D one).
+- **Displacements**: VTK's reader moves the points by displacement variables
+  (`DISPL*`) unless you call `reader.disable_displacements()`.
+- **Time and globals**: only the reader's active time step is in the
+  `MultiBlock`; pass `times=[reader.active_time_value]` to keep its time
+  value. Global variables are not written from VTK's output (its field data
+  holds whole histories, with a warning); pass them as `global_fields`.
 
 A grid from `read_exo` can be written back too: use its block ids as
-regions. Side sets and node sets are not part of the grid; pass them back as
-`surface` and `node_sets` (see `examples/example_read_back.py`).
+regions. Its global variables (field data) are written back as well, and a
+3D file stays 3D. Side sets and node sets are not part of the grid; pass them
+back as `surface` and `node_sets` (see `examples/example_read_back.py`).
 
 ```python
 grid = exovista.read_exo("model.exo")
@@ -597,10 +647,10 @@ exovista.write_exo(
 
 | Parameter | Type | Description |
 |---|---|---|
-| `filename` | path | Output file. Written to a temporary file next to it and moved into place when complete: on error no file is created and an existing file is left untouched. A symbolic link's target is replaced; an existing file keeps its permissions. |
+| `filename` | path | Output file. Written to a temporary file next to it and moved into place when complete: on error no file is created and an existing file is left untouched. A symbolic link's target is replaced; an existing file keeps its permissions, and one that is not writable raises `PermissionError`. |
 | `volume` | `pyvista.DataSet` or `pyvista.MultiBlock` | The mesh (cast to `UnstructuredGrid` as needed). A `MultiBlock` gives one region per non-empty leaf; VTK Exodus reader output is recognised. Never modified. |
 | `surface` | `pyvista.DataSet`, optional | Faces (3D) or edges (`num_dim = 2`) to write as side sets, one set per region value. |
-| `region_key` | `str`, default `"region"` | Cell array that assigns cells (and surface cells) to regions; integer or string values. |
+| `region_key` | `str`, default `"region"` | Cell array that assigns cells (and surface cells) to regions; integer or string values. Without the default array, one region; any other name must be a cell array of the volume or surface (`KeyError`). |
 | `block_names` | list, dict or str, optional | Block names: list in sorted region order, `{region: name}`, or one name. Default region string / leaf key / `"block_<id>"`. |
 | `side_set_names` | list, dict or str, optional | Side-set names, like `block_names`; default `"side_set_<id>"`. |
 | `node_sets` | dict or list, optional | `{name: indices}` or a list of index arrays (`"node_set_<id>"`); 0-based point indices or a boolean mask. |
@@ -609,16 +659,17 @@ exovista.write_exo(
 | `times` | array-like, optional | Time value of each step. Default: one step at t = 0.0 when any variable is written. |
 | `node_fields` | dict, optional | `{name: (n_steps, n_points[, n_components])}`; for one step also `(n_points[, n_components])`. Replaces a point array of the same name. |
 | `element_fields` | dict, optional | Like `node_fields` with one column per cell, in the original `volume` cell order. |
-| `global_fields` | dict, optional | `{name: (n_steps[, n_components])}` global variables. |
-| `num_dim` | `None`, 2 or 3 | `None`: 2 when there are no 3D cells and all points share one z, else 3. |
+| `global_fields` | dict, optional | `{name: (n_steps[, n_components])}` global variables. The global variables in the field data of `read_exo` output are written too (constant in time). |
+| `num_dim` | `None`, 2 or 3 | `None`: 3 for `read_exo` output of a 3D file; else 2 when there are no 3D cells and all points share one z (z is not stored: a warning when it is not 0), else 3. In 3D files 2D cells are shells (`TRI3`/`TRI6`, `SHELL4`/`SHELL8`; `QUAD9`). |
 | `precision` | `"double"` or `"single"` | Storage of coordinates, times and variables (float64 / float32). |
 | `compression_level` | `int` 0-9, optional | zlib level (0 disables compression); default from `EXODUSII_COMPRESSION_LEVEL` (1). |
 | `side_set_tolerance` | `float`, optional | Largest surface-point-to-node distance; default `1e-6` times the bounding-box diagonal. |
-| `title` | `str`, optional | Database title (default `"exovista"`). |
+| `title` | `str`, optional | Database title (default `"exovista"`); longer than 80 bytes is cut, with a warning (Exodus readers keep 80). |
 
 Raises `ValueError` for an empty mesh, unsupported cell types, a surface that
 does not match the volume, or inconsistent names and shapes; `TypeError` for
-inputs of the wrong type.
+inputs of the wrong type; `KeyError` for a `region_key` that names no cell
+array; `PermissionError` for a target that is not writable.
 
 ### `read_exo`
 
@@ -640,9 +691,9 @@ exovista.read_exo(
 | `time_step` | `int`, default `-1` | 1-based step for node, element and global variables; negative counts from the end; `0` and out-of-range steps raise `IndexError`. Ignored (except `0`) when the file has no steps. |
 | `read_node_variables` | bool, str or list of str | Node variables to load into `point_data`: all, none, or the given names (combined or stored names). Unknown names raise `KeyError`. |
 | `read_element_variables` | bool, str or list of str | Same for element variables (`cell_data`). |
-| `read_global_variables` | bool, str or list of str | Same for global variables (`field_data`, one-element arrays at `time_step`). |
+| `read_global_variables` | bool, str or list of str | Same for global variables (`field_data`: the value at `time_step`, shape `(1,)`, or `(1, n_components)` when recombined). |
 | `read_side_sets` | `bool`, default `False` | Also return the side sets (`read_side_sets` result). |
-| `combine_components` | `bool`, default `True` | Recombine `_X/_Y/_Z`, tensor and `_0.._n` component variables into one array when all components are present and the combined name is not itself a variable. |
+| `combine_components` | `bool`, default `True` | Recombine `_X/_Y/_Z`, tensor and `_0.._n` component variables (node, element and global) into one array when all components are present and the combined name is not itself a variable. |
 | `original_order` | `bool`, default `True` | Sort cells by element id when the element id map is a permutation of `1..num_elem` (restores `write_exo`'s input order); otherwise file order. |
 
 Returns the grid (float64 points in file node order; cell data
@@ -660,14 +711,14 @@ entries, and variables whose names clash with the reserved arrays.
 | `read_node_sets(filename, *files)` | `dict[str, numpy.ndarray]`: 0-based int64 point indices into the `read_exo` points. |
 | `read_node_fields(filename, *files, names=None, combine_components=False)` | `{name: (n_steps, n_nodes[, n_components])}` float64 histories. |
 | `read_element_fields(filename, *files, names=None, combine_components=False, original_order=True)` | `{name: (n_steps, n_cells[, n_components])}`; NaN on blocks where a variable is not defined; columns in the `read_exo` cell order. |
-| `read_global_fields(filename, *files, names=None)` | `{name: (n_steps,)}` float64 histories. |
+| `read_global_fields(filename, *files, names=None, combine_components=False)` | `{name: (n_steps[, n_components])}` float64 histories. |
 
 `names` selects variables (a name or a list; unknown names raise `KeyError`).
 
 ### Other entry points
 
 - **`mesh.save("model.exo", **kwargs)`**: the `pyvista.writers` plugin for
-  `.exo`, `.e`, `.ex2`, `.exii` and `.gen`; equivalent to
+  `.exo`, `.e`, `.ex2`, `.exii` and `.gen` (PyVista >= 0.48); equivalent to
   `write_exo("model.exo", mesh, **kwargs)`.
 - **`exovista-read`**: command-line summary of a file, or values of chosen
   variables (`exovista-read model.exo`, `exovista-read -n temperature -i -1 model.exo`;
@@ -675,9 +726,10 @@ entries, and variables whose names clash with the reserved arrays.
   called `exoread.py` in 1.x.
 - **`exovista.legacy`**: the low-level Sandia API this project grew from
   (`exodusii_file`, `parallel_exodusii_file`, `allclose`, `similar`,
-  `lineout`, `find_element_data_in_region`, ...). Importing these names from
-  the top-level `exovista` package still works in 2.x but emits a
-  `DeprecationWarning`; they will be removed from it in 3.0.
+  `lineout`, `find_element_data_in_region`, ...). Accessing these names on
+  the top-level package (`exovista.exodusii_file`) still works in 2.x but
+  emits a `DeprecationWarning`, and they will be removed from it in 3.0;
+  `from exovista import *` no longer brings them.
 
 ```python
 from exovista.legacy import exodusii_file
@@ -694,9 +746,9 @@ with exodusii_file("model.exo") as f:
 - **Shells, bars and spheres are not side-set targets**: side sets are faces
   of 3D elements or edges of planar 2D elements.
 - **Fixed-length time dimension**: files are written in one go, with a
-  fixed-length `time_step` dimension (much faster to read with netCDF-4); time
-  steps cannot be appended to an existing file, and the whole history must fit
-  in memory.
+  fixed-length `time_step` dimension (much faster to read with netCDF-4) and
+  one compressed chunk per time step; time steps cannot be appended to an
+  existing file, and the whole history must fit in memory.
 - **netCDF-4 output**: files are `NETCDF4_CLASSIC` (HDF5-based, also with
   `compression_level=0`). VTK/ParaView, meshio and netCDF4-python read them
   (tested), as should any Exodus reader built on a netCDF library with
@@ -733,7 +785,10 @@ with exodusii_file("model.exo") as f:
   deprecated aliases) and are keyed uniquely.
 - The low-level API moved to `exovista.legacy`; the command-line tool is
   `exovista-read`; Python >= 3.10 is required.
-- Files have a fixed-length time dimension.
+- Files have a fixed-length time dimension; the default title is
+  `exovista` (was `pyvista_mesh`).
+- `from exovista import *` no longer brings the legacy names; the
+  `write_pyvista` helpers `vtk2exo*` and `process_meshes` are gone.
 
 ## Contributing
 

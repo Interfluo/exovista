@@ -42,7 +42,7 @@ def main():
     mesh = exovista.read_exo(filename)
     print("num_dim       :", int(mesh.field_data["num_dim"][0]))
     print("block ids     :", mesh.cell_data["exo_block_id"])
-    print("block names   :", list(mesh.cell_data["exo_block_name"]))
+    print("block names   :", np.asarray(mesh.cell_data["exo_block_name"]).tolist())
     same = np.array_equal(mesh.cell_connectivity, grid.cell_connectivity)
     print("cells in input order:", same)
 

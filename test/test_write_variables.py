@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import pyvista as pv
 
+from _pvcompat import exodus_reader
 from exovista._backend import open_reader
 from exovista.write_pyvista import write_exo
 
@@ -20,7 +21,7 @@ CT = pv.CellType
 
 
 def vtk_read(path, time_point=0):
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.enable_all_point_arrays()
     reader.enable_all_cell_arrays()
     reader.reader.SetAllArrayStatus(reader.reader.GLOBAL, 1)
@@ -176,7 +177,7 @@ def test_helper_and_region_arrays_are_not_written(tmp_path):
     for leaked in ("orig_pts", "orig_cell_ids", "cell_ids", "face_ids", "vtkOrig"):
         assert leaked not in text
     # region is written when it is not the region key
-    write_exo(tmp_path / "r.exo", grid, region_key="other")
+    write_exo(tmp_path / "r.exo", grid, region_key=None)
     assert "region" in var_names(tmp_path / "r.exo")[1]
 
 

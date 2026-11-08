@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 import pyvista as pv
 
+from _pvcompat import exodus_reader, extract_surface, requires_pyvista
 from exovista import (
     read_element_fields,
     read_exo,
@@ -45,9 +46,7 @@ def hexes(nx, ny, nz):
 
 
 def surface_of(mesh):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", pv.PyVistaFutureWarning)
-        return mesh.extract_surface(algorithm=None)
+    return extract_surface(mesh)  # algorithm=None: outward faces
 
 
 def face_keys(mesh):
@@ -69,7 +68,7 @@ def by_point(grid, name):
 
 
 def vtk_reader(path, sets=True):
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     reader.enable_all_cell_arrays()
     reader.enable_all_point_arrays()
     if sets:
@@ -80,6 +79,7 @@ def vtk_reader(path, sets=True):
 
 def vtk_reads_in_subprocess(path):
     """Exit code of reading ``path`` with VTK in a child process (-11: crash)."""
+    requires_pyvista("0.45", "pv.ExodusIIReader (VTK's Exodus reader oracle)")
     code = (
         "import sys, pyvista as pv\n"
         "r = pv.ExodusIIReader(sys.argv[1])\n"
@@ -332,9 +332,13 @@ def test_vtk_output_of_unnamed_2d_file(tmp_path):
     src = tmp_path / "unnamed.exo"
     write_model(src, model)
     out = tmp_path / "out.exo"
+    # VTK's output does not say whether the file was 2D: automatic num_dim
+    # warns, an explicit num_dim=2 does not
+    with pytest.warns(UserWarning, match="pass num_dim=3 to write shells"):
+        write_exo(out, vtk_reader(src).read())
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        write_exo(out, vtk_reader(src).read())
+        write_exo(out, vtk_reader(src).read(), num_dim=2)
     with open_reader(out) as r:
         assert r.num_dim == 2
         assert [(b.id, b.name) for b in r.blocks()] == [(7, "block_7")]
@@ -492,12 +496,25 @@ def test_names_are_nul_padded(tmp_path):
     assert "T" in mesh.point_data and "pins" in mesh.point_sets
 
 
-def test_target_file_long_name_symlink_and_permissions(tmp_path):
+def test_target_file_long_name(tmp_path):
+    """The temporary file name stays short for a long (valid) target name."""
     grid = hexes(1, 1, 1)
-    long_name = tmp_path / ("x" * 240 + ".exo")  # 244 bytes: a valid name
+    n = 240  # 244 bytes: a valid name (NAME_MAX is 255)
+    if sys.platform == "win32":  # keep the whole path within MAX_PATH (260)
+        n = min(n, 250 - len(str(tmp_path)) - len(".exo"))
+    long_name = tmp_path / ("x" * n + ".exo")
     write_exo(long_name, grid)
     assert long_name.exists()
+    assert os.listdir(tmp_path) == [long_name.name]  # no temporary file left
 
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX permission bits and symbolic links (Windows has neither "
+    "mode bits beyond read-only nor unprivileged symlinks)",
+)
+def test_target_file_symlink_and_permissions(tmp_path):
+    grid = hexes(1, 1, 1)
     real = tmp_path / "real.exo"
     write_exo(real, grid)
     os.chmod(real, 0o600)
@@ -509,12 +526,13 @@ def test_target_file_long_name_symlink_and_permissions(tmp_path):
     assert read_exo(real).n_cells == 2
     assert stat.S_IMODE(os.stat(real).st_mode) == 0o600
     assert sorted(os.listdir(tmp_path)) == sorted(
-        [long_name.name, "real.exo", "link.exo"])  # no temporary files left
+        ["real.exo", "link.exo"])  # no temporary files left
 
 
 def test_single_precision_overflow(tmp_path):
     grid = hexes(1, 1, 1)
     far = grid.copy()
+    far.points = np.asarray(far.points, dtype=float)  # float32 in older PyVista
     far.points[:, 0] *= 1e39
     with pytest.raises(ValueError, match="coordinates reach"):
         write_exo(tmp_path / "s.exo", far, precision="single")

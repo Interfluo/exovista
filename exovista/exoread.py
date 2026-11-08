@@ -10,6 +10,8 @@ so that it no longer collides with the script of the upstream ``exodusii``
 package.
 """
 
+import errno
+import os
 import sys
 import glob
 import argparse
@@ -41,10 +43,6 @@ def main(argv=None, file=None):
 
     Default for spatial variables is to write out the values for each object for the
     last time slab.
-
-    Special nodal variable names are the geometry coordinates, "COORDINATES", and the
-    motion displacements, "DISPLACEMENTS". When you ask for one of them, you get each
-    component of the vector.
     """
 
     from . import __version__
@@ -138,19 +136,43 @@ def main(argv=None, file=None):
     p.add_argument("file", help="The ExodusII database file.")
 
     args = p.parse_args(argv, namespace=Namespace())
-    f = exo_file(args.file)
-    if args.variables:
-        f.print(
-            *args.variables,
-            time=args.time,
-            index=args.index,
-            cycle=args.cycle,
-            lineout=args.lineout,
-            file=file,
-            labels=not args.nolabels,
-        )
-    else:
-        f.describe(file=file)
+    try:
+        f = exo_file(args.file)
+        try:
+            if "num_dim" not in f.files[0].dimensions:
+                raise ValueError(f"{args.file}: not an ExodusII file")
+            if args.variables:
+                f.print(
+                    *args.variables,
+                    time=args.time,
+                    index=args.index,
+                    cycle=args.cycle,
+                    lineout=args.lineout,
+                    file=file,
+                    labels=not args.nolabels,
+                )
+            else:
+                f.describe(file=file)
+        finally:
+            f.close()
+    except BrokenPipeError:
+        # the reader of the output went away (``exovista-read x.exo | head``)
+        if file is None or file is sys.stdout:
+            _silence_stdout()
+        return 1
+    except (OSError, ValueError, KeyError, IndexError) as exc:
+        message = exc.args[0] if isinstance(exc, KeyError) and exc.args else exc
+        p.exit(1, f"exovista-read: error: {message}\n")
+    return 0
+
+
+def _silence_stdout():
+    """Point stdout at devnull so that flushing it at exit cannot fail again."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass  # stdout has no file descriptor (e.g. captured by a test runner)
 
 
 def exo_file(filename, *files):
@@ -168,7 +190,7 @@ def _find_files(*files):
     for file in files:
         globbed_files = glob.glob(file)
         if not globbed_files:
-            raise FileNotFoundError(file)
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", file)
         found.extend(globbed_files)
     return found
 

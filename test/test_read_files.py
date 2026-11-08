@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import pyvista as pv
 
+from _pvcompat import exodus_reader, p_exodus_reader, validate_mesh
 from exovista import _celltypes as ct
 from exovista import read_pyvista as rp
 from exovista._backend import write_model
@@ -50,11 +51,11 @@ def test_data_file_matches_vtk_reader(datafile, name):
     path = datafile(name)
     grid, side_sets = rp.read_exo(path, read_side_sets=True, original_order=False)
     assert grid.points.dtype == np.float64
-    assert grid.validate_mesh(["wrong_number_of_points", "invalid_point_references",
-                               "non_finite_points"]).is_valid
+    assert validate_mesh(grid, ["wrong_number_of_points", "invalid_point_references",
+                                "non_finite_points"]).is_valid
     assert set(grid.celltypes) <= {VTK.QUAD, VTK.HEXAHEDRON}
 
-    reader = pv.ExodusIIReader(path)
+    reader = exodus_reader(path)
     reader.reader.SetSqueezePoints(False)  # point ids are file node indices
     reader.disable_displacements()
     reader.enable_all_point_arrays()
@@ -130,7 +131,7 @@ def test_parallel_decompositions(datafile, pattern, base, n_nodes, n_elem):
         for key in serial.field_data.keys():
             np.testing.assert_allclose(grid.field_data[key], serial.field_data[key],
                                        rtol=1e-6, atol=1e-6)
-    assert joined.validate_mesh().is_valid
+    assert validate_mesh(joined).is_valid
     assert _normalized(joined, joined_sets) == _normalized(serial, serial_sets)
 
     joined_ns = rp.read_node_sets(*parts)
@@ -148,7 +149,7 @@ def test_parallel_decompositions(datafile, pattern, base, n_nodes, n_elem):
                                    atol=1e-6)
 
     # VTK's parallel reader: the same cells, keyed by global element id
-    reader = pv.PExodusIIReader(parts[0])
+    reader = p_exodus_reader(parts[0])
     reader.disable_displacements()
     reader.reader.GenerateGlobalElementIdArrayOn()
     by_id = {}
@@ -228,7 +229,7 @@ def test_meshio_file(tmp_path):
     assert list(grid.celltypes) == [VTK.HEXAHEDRON, VTK.PYRAMID]
     assert _cell_rows(grid) == [tuple(range(8)), (4, 5, 6, 7, 8)]
     assert list(grid.cell_data["exo_block_name"]) == ["", ""]
-    assert grid.validate_mesh().is_valid
+    assert validate_mesh(grid).is_valid
     assert list(grid.point_data.keys()) == ["T", "vel", "uv"]
     np.testing.assert_array_equal(grid.point_data["vel"], mesh.point_data["vel"])
     np.testing.assert_array_equal(grid.point_data["uv"], mesh.point_data["uv"])
@@ -390,7 +391,7 @@ def test_exovista_1x_file_with_fields(tmp_path):
     np.testing.assert_array_equal(grid.point_data["nf"], np.arange(18.0))
     np.testing.assert_array_equal(grid.point_data["temp"], np.arange(18) * 1.5)
     assert "orig_pts" in grid.point_data  # stored in the file: read as is
-    assert grid.validate_mesh().is_valid
+    assert validate_mesh(grid).is_valid
     assert side_sets.keys() == ["bottom", "top"]
     assert side_sets["bottom"].n_cells == 12 and side_sets["top"].n_cells == 4
     centers = side_sets["top"].cell_centers().points
@@ -399,7 +400,7 @@ def test_exovista_1x_file_with_fields(tmp_path):
         rp.read_element_fields(path)["ef"], np.outer([0, 0.5, 1], [0, 2, 1, 3])
     )
     # VTK reads the same file
-    reader = pv.ExodusIIReader(str(path))
+    reader = exodus_reader(str(path))
     assert reader.element_blocks.names == ["left", "right"]
 
 
@@ -485,7 +486,7 @@ def test_vtk_written_file(tmp_path):
         grid = rp.read_exo(path)
     assert list(grid.celltypes) == [VTK.HEXAHEDRON, VTK.PYRAMID]
     np.testing.assert_array_equal(grid.cell_data["exo_block_id"], [1, 2])
-    assert grid.validate_mesh().is_valid
+    assert validate_mesh(grid).is_valid
     # VTK's suffixes have no underscore: not exovista's convention, not combined
     assert list(grid.point_data.keys()) == ["velX", "velY", "velZ"]
     for k, key in enumerate(["velX", "velY", "velZ"]):

@@ -31,11 +31,11 @@ PyVista forwards it), ``binary`` and ``recompute_normals`` are ignored,
 ``"zlib"`` -> the default level, anything else is rejected) and a
 ``texture`` raises :class:`ValueError`.
 
-exovista requires PyVista >= 0.49, which always has the registry.  With an
-older PyVista forced into the environment (< 0.48 has no writer registry),
-importing exovista still works but ``mesh.save("x.exo")`` raises PyVista's
-"Invalid file extension" ``ValueError``; call :func:`exovista.write_exo`
-directly there.
+The writer registry exists from PyVista 0.48 on.  exovista itself supports
+PyVista >= 0.42: with PyVista 0.42 to 0.47, importing exovista and every
+exovista function work, but ``mesh.save("x.exo")`` raises PyVista's "Invalid
+file extension" ``ValueError``; call :func:`exovista.write_exo` directly
+there.
 """
 
 from __future__ import annotations
