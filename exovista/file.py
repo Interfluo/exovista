@@ -93,6 +93,27 @@ def _name_at(names, iid):
 MAX_NAME_LENGTH = 256
 
 
+def _char_row(text, length):
+    """``text`` as a blank-padded netCDF char (``S1``) row of ``length`` bytes.
+
+    Exodus stores names as raw bytes; they are UTF-8 encoded here (and decoded
+    as UTF-8 on read). Raises ValueError if the encoded text is longer than
+    ``length`` bytes.
+    """
+    data = str(text).encode("utf-8")
+    if len(data) > length:
+        raise ValueError(
+            f"{str(text)[:40]!r}... is {len(data)} bytes long (UTF-8); at most "
+            f"{length} fit"
+        )
+    return np.frombuffer(data.ljust(length, b" "), dtype="S1")
+
+
+def _truncate_utf8(text, n_bytes):
+    """``text`` cut to at most ``n_bytes`` UTF-8 bytes (whole characters only)."""
+    return str(text).encode("utf-8")[:n_bytes].decode("utf-8", "ignore")
+
+
 class exodusii_file:
     """
     A file object for Exodus data.
@@ -2019,12 +2040,17 @@ class exodusii_file:
 
         Returns
         -------
-        gvar_val : float
+        gvar_val : numpy float scalar
         """
         var_iid = self.get_global_variable_iid(var_name)
         if var_iid is None:
             raise KeyError(f"{var_name!r} is not a global variable")
-        return self._get_time_variable(ex.VAR_GLO_VAR, time_step, column=var_iid - 1)
+        value = self._get_time_variable(ex.VAR_GLO_VAR, time_step, column=var_iid - 1)
+        # netCDF4 returns a 0-d array for a single element; callers expect a
+        # (hashable) numpy scalar, as before the single-step read.
+        if isinstance(value, np.ndarray) and value.ndim == 0:
+            value = value[()]
+        return value
 
     def get_global_variable_values(self, var_name):
         """Get global variable values over all time steps for one global variable
@@ -2696,12 +2722,21 @@ class exodusii_file:
         return _select_time_step(values, time_step)
 
     def _pad_name(self, name):
+        """``name`` as a UTF-8, blank-padded ``len_name`` char row.
+
+        Also raises the ``maximum_name_length`` attribute (in bytes, which is
+        what readers allocate) when needed.
+        """
         name = str(name)
-        if len(name) > MAX_NAME_LENGTH:
-            raise ValueError(f"name {name!r} exceeds {MAX_NAME_LENGTH} characters")
-        if len(name) > int(getattr(self.fh, "maximum_name_length", 32)):
-            self.setattr("maximum_name_length", len(name))
-        return name.ljust(MAX_NAME_LENGTH)
+        n_bytes = len(name.encode("utf-8"))
+        if n_bytes > MAX_NAME_LENGTH:
+            raise ValueError(
+                f"name {name!r} is {n_bytes} bytes long (UTF-8); Exodus allows at "
+                f"most {MAX_NAME_LENGTH}"
+            )
+        if n_bytes > int(getattr(self.fh, "maximum_name_length", 32)):
+            self.setattr("maximum_name_length", n_bytes)
+        return _char_row(name, MAX_NAME_LENGTH)
 
     @requires_write_mode
     def initw(self):
@@ -3683,6 +3718,10 @@ class exodusii_file:
         """
         names = self.get_element_variable_names()
         var_iid = self.get_iid(names, name)
+        if var_iid is None:
+            raise KeyError(
+                f"{name!r} is not an element variable; stored names: {names}"
+            )
         block_iid = self.get_element_block_iid(block_id)
         key = ex.VAR_ELEM_VAR(var_iid, block_iid)
         if time_step is None:
@@ -3983,8 +4022,8 @@ class exodusii_file:
         self.create_variable(ex.VAR_INFO, str, (ex.DIM_NUM_INFO, ex.DIM_LIN))
         len_line = self.get_dimension(ex.DIM_LIN)
         for (i, info_record) in enumerate(info):
-            # pad to the line dimension (at most len_line - 1 characters)
-            value = str(info_record)[: len_line - 1].ljust(len_line)
+            # pad to the line dimension (at most len_line - 1 bytes)
+            value = _char_row(_truncate_utf8(info_record, len_line - 1), len_line)
             self.fill_variable(ex.VAR_INFO, i, value)
 
     @requires_write_mode
@@ -4366,6 +4405,8 @@ class exodusii_file:
         """
         names = self.get_node_variable_names()
         var_iid = self.get_iid(names, name)
+        if var_iid is None:
+            raise KeyError(f"{name!r} is not a node variable; stored names: {names}")
         key = ex.VAR_NODE_VAR(var_iid)
         if time_step is None:
             self.fh.variables[key][:] = values
@@ -4403,8 +4444,8 @@ class exodusii_file:
         len_str = self.get_dimension(ex.DIM_STR)
         for (i, qa_record) in enumerate(qa_records):
             for j in range(4):
-                # pad to the string dimension (at most len_str - 1 characters)
-                value = str(qa_record[j])[: len_str - 1].ljust(len_str)
+                # pad to the string dimension (at most len_str - 1 bytes)
+                value = _char_row(_truncate_utf8(qa_record[j], len_str - 1), len_str)
                 self.fill_variable(ex.VAR_QA_TITLE, i, j, value)
 
     @requires_write_mode

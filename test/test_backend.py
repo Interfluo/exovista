@@ -6,6 +6,7 @@ inspect the files directly.
 
 import glob
 import os
+import shutil
 import subprocess
 import sys
 import tracemalloc
@@ -19,7 +20,7 @@ import pyvista as pv
 import exovista
 from exovista import _backend, nc
 from exovista._backend import open_reader, read_model, write_model
-from exovista._model import Block, ExodusModel, NodeSet, SideSet
+from exovista._model import Block, ExodusModel, NodeSet, SideSet, component_suffixes
 from exovista.file import exodusii_file
 from exovista.parallel_file import parallel_exodusii_file
 
@@ -350,6 +351,16 @@ def test_write_is_atomic(tmp_path, monkeypatch):
             "duplicate",
         ),
         (dict(coords=np.zeros((10, 2))), "coords"),
+        # ids and the element map are stored as 32-bit integers
+        (
+            dict(blocks=[Block(2**31, "b", "HEX8", [list(range(8))])]),
+            "element block id 2147483648 does not fit",
+        ),
+        (dict(side_sets=[SideSet(2**31 + 7, "s", [0], [1])]), "side set id"),
+        (dict(node_sets=[NodeSet(-(2**31) - 1, "n", [0])]), "node set id"),
+        (dict(elem_id_map=[1, 2**31, 2]), "elem_id_map values must be in"),
+        (dict(elem_id_map=[0, 1, 2]), "elem_id_map values must be in"),
+        (dict(elem_id_map=[3, 3, 1]), "duplicate element ids"),
     ],
 )
 def test_validation(tmp_path, overrides, match):
@@ -369,6 +380,113 @@ def test_name_too_long(tmp_path):
     with pytest.raises(ValueError, match="256"):
         write_model(tmp_path / "never.exo", model)
     assert not os.listdir(tmp_path)
+
+
+def test_name_limit_counts_utf8_bytes(tmp_path):
+    """len_name is 256 bytes: 128 two-byte characters fit, 129 do not."""
+    Block(1, "é" * 128, "HEX8", np.zeros((1, 8), int))
+    with pytest.raises(ValueError, match="258 bytes"):
+        Block(1, "é" * 129, "HEX8", np.zeros((1, 8), int))
+    model = _hex_tet_model(global_vars={"σ" * 129: np.zeros(3)})
+    with pytest.raises(ValueError, match="258 bytes"):
+        write_model(tmp_path / "never.exo", model)
+    with pytest.raises(ValueError, match="NUL"):
+        SideSet(1, "a\0b", [], [])
+    with pytest.raises(ValueError, match="NUL"):
+        write_model(
+            tmp_path / "never.exo", _hex_tet_model(node_vars={"a\0": np.zeros((3, 10))})
+        )
+    assert not os.listdir(tmp_path)
+
+
+# Non-ASCII names, stored as UTF-8 bytes. VTK drops leading and trailing
+# non-ASCII characters of *variable* names (it reads 'σ_xx' as '_xx'), so the
+# variable names checked against VTK start and end with an ASCII letter.
+UTF8_NAMES = {
+    "block": "bloc-é" + "é" * 20,  # 26 characters, 47 bytes
+    "side_set": "σ_surface",
+    "node_set": "节点集",
+    "node_var": "Température",
+    "elem_var": "Größe",
+    "global_var": "énergie",
+}
+
+
+def test_non_ascii_names_roundtrip(tmp_path):
+    names = UTF8_NAMES
+    model = _hex_tet_model(
+        blocks=[
+            Block(10, names["block"], "HEX8", [[0, 1, 2, 3, 4, 5, 6, 7]]),
+            Block(20, "tets", "TETRA4", [[1, 8, 9, 5], [1, 9, 2, 5]]),
+        ],
+        side_sets=[SideSet(1, names["side_set"], [0], [4])],
+        node_sets=[NodeSet(3, names["node_set"], [0, 1])],
+        node_vars={names["node_var"]: np.ones((3, 10))},
+        elem_vars={names["elem_var"]: {20: np.full((3, 2), 2.0)}},
+        global_vars={names["global_var"]: np.arange(3.0)},
+        qa_records=[("exövista", "2.0.0", "ü" * 40, "12:00")],
+        info=["ïnfo " * 30],
+    )
+    path = tmp_path / "utf8.exo"
+    write_model(path, model)
+    back = read_model(path)
+    _assert_models_equal(model, back)
+    # QA / info records are cut to their fixed width at a character boundary
+    assert back.qa_records == [("exövista", "2.0.0", "ü" * 16, "12:00")]
+    assert back.info == [("ïnfo " * 30).encode()[:80].decode("utf-8", "ignore")]
+
+    with netCDF4.Dataset(path) as ds:
+        raw = np.ma.getdata(ds["eb_names"][0]).tobytes().rstrip()
+        assert raw == names["block"].encode("utf-8")
+        # readers size their name buffers from this attribute: bytes
+        assert ds.maximum_name_length == len(names["block"].encode("utf-8")) == 47
+
+    reader = pv.ExodusIIReader(str(path))
+    assert reader.element_blocks.names[0] == names["block"]
+    assert reader.side_sets.names == [names["side_set"]]
+    assert reader.node_sets.names == [names["node_set"]]
+    reader.enable_all_point_arrays()
+    reader.enable_all_cell_arrays()
+    blocks = reader.read()["Element Blocks"]
+    assert names["node_var"] in blocks[0].point_data
+    assert names["elem_var"] in blocks[1].cell_data
+
+
+def test_names_keep_leading_and_lose_trailing_whitespace(tmp_path):
+    """Exodus readers strip trailing blanks only; the model does the same."""
+    model = _hex_tet_model(
+        blocks=[
+            Block(10, " padded block ", "HEX8", [[0, 1, 2, 3, 4, 5, 6, 7]]),
+            Block(20, "tets\t", "TETRA4", [[1, 8, 9, 5], [1, 9, 2, 5]]),
+        ],
+        side_sets=[SideSet(1, "left  ", [0], [4])],
+        node_sets=[NodeSet(3, " bottom", [0])],
+        node_vars={"Pressure ": np.ones((3, 10)), " u": np.zeros((3, 10))},
+        elem_vars={"e\t": {10: np.ones((3, 1))}},
+        global_vars={"g  ": np.arange(3.0)},
+    )
+    assert [b.name for b in model.blocks] == [" padded block", "tets"]
+    assert list(model.node_vars) == ["Pressure", " u"]
+    assert list(model.elem_vars) == ["e"]
+    assert list(model.global_vars) == ["g"]
+    write_model(tmp_path / "ws.exo", model)
+    back = read_model(tmp_path / "ws.exo")
+    _assert_models_equal(model, back)
+    assert back.side_sets[0].name == "left"
+    assert back.node_sets[0].name == " bottom"
+    with open_reader(tmp_path / "ws.exo") as r:
+        np.testing.assert_array_equal(r.node_var(" u", 0), np.zeros(10))
+        with pytest.raises(KeyError):
+            r.node_var("u")
+
+    # names that only differ by trailing whitespace would collide in the file
+    for kwargs in (
+        dict(node_vars={"u": np.zeros((3, 10)), "u ": np.ones((3, 10))}),
+        dict(elem_vars={"e": {10: np.ones((3, 1))}, "e\n": {20: np.ones((3, 2))}}),
+        dict(global_vars={"g": np.zeros(3), "g\t": np.zeros(3)}),
+    ):
+        with pytest.raises(ValueError, match="trailing whitespace"):
+            _hex_tet_model(**kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -441,6 +559,10 @@ def test_open_reader_parallel_matches_serial(datadir, datafile, pattern, base,
     joined = read_model(*files)
     serial = read_model(datafile(base))
     assert (joined.num_nodes, joined.num_elem) == (n_nodes, n_elem)
+    serial_ids = serial.elem_id_map
+    if serial_ids is None:
+        serial_ids = np.arange(1, n_elem + 1)
+    np.testing.assert_array_equal(joined.elem_id_map, serial_ids)
     np.testing.assert_array_equal(joined.coords, serial.coords)
     for a, b in zip(joined.blocks, serial.blocks):
         assert (a.id, a.n_elem) == (b.id, b.n_elem)
@@ -463,6 +585,106 @@ def test_open_reader_parallel_matches_serial(datadir, datafile, pattern, base,
     for name in serial.global_vars:
         np.testing.assert_allclose(joined.global_vars[name],
                                    serial.global_vars[name], rtol=1e-6)
+
+
+def _all_elements(model):
+    """(block id, connectivity) per element in joined order, plus element
+    variables as ``{name: (n_steps, num_elem)}`` (NaN where undefined)."""
+    rows = [(b.id, tuple(row)) for b in model.blocks for row in b.conn.tolist()]
+    offsets = model.block_offsets()
+    values = {}
+    for name, per_block in model.elem_vars.items():
+        out = np.full((model.n_steps, model.num_elem), np.nan)
+        for k, block in enumerate(model.blocks):
+            if block.id in per_block:
+                out[:, offsets[k]:offsets[k + 1]] = per_block[block.id]
+        values[name] = out
+    return rows, values
+
+
+@pytest.mark.parametrize("pattern", ["mkmesh.par.2.*", "noh.exo.3.*"])
+def test_parallel_join_non_contiguous_global_ids(datadir, tmp_path, pattern):
+    """Global element ids need not be contiguous per block (nor at all).
+
+    The pieces are copied and their element ids relabelled: the first element
+    of the first block and the last element of the last block swap ids, and
+    every id is multiplied by 10 (gaps). The join must describe the same
+    elements, side sets and element variables as the original.
+    """
+    files = sorted(glob.glob(os.path.join(datadir, pattern)))
+    original = read_model(*files)
+    n = original.num_elem
+    np.testing.assert_array_equal(original.elem_id_map, np.arange(1, n + 1))
+
+    def relabel(gid):
+        return 10 * {1: n, n: 1}.get(gid, gid)
+
+    def original_index(new_gid):
+        return {1: n, n: 1}.get(new_gid // 10, new_gid // 10) - 1
+
+    copies = []
+    for path in files:
+        copy = tmp_path / os.path.basename(path)
+        shutil.copy(path, copy)
+        with netCDF4.Dataset(copy, "a") as ds:
+            ids = np.ma.getdata(ds["elem_num_map"][:])
+            ds["elem_num_map"][:] = [relabel(int(g)) for g in ids]
+        copies.append(str(copy))
+
+    joined = read_model(*copies)
+    assert [(b.id, b.n_elem) for b in joined.blocks] == [
+        (b.id, b.n_elem) for b in original.blocks
+    ]
+    ids = joined.elem_id_map
+    for b, block_ids in zip(joined.blocks, np.split(ids, joined.block_offsets()[1:-1])):
+        assert list(block_ids) == sorted(block_ids), b.id  # ids increase per block
+    assert sorted(ids) == sorted(relabel(g) for g in range(1, n + 1))
+    where = np.array([original_index(int(g)) for g in ids])
+    assert sorted(where) == list(range(n))
+
+    new_rows, new_values = _all_elements(joined)
+    old_rows, old_values = _all_elements(original)
+    assert new_rows == [old_rows[i] for i in where]
+    assert list(new_values) == list(old_values)
+    for name in old_values:
+        np.testing.assert_array_equal(new_values[name], old_values[name][:, where])
+    for new, old in zip(joined.side_sets, original.side_sets):
+        assert new.id == old.id
+        assert sorted(zip(where[new.elems], new.sides)) == sorted(
+            zip(old.elems, old.sides)
+        )
+    np.testing.assert_array_equal(joined.coords, original.coords)
+    for name in original.node_vars:
+        np.testing.assert_array_equal(joined.node_vars[name], original.node_vars[name])
+
+    # single-step element reads agree with the history
+    with open_reader(*copies) as r:
+        for name in r.elem_var_names()[:2]:
+            for block in r.blocks():
+                np.testing.assert_array_equal(
+                    r.elem_var(name, block.id, 0), r.elem_var(name, block.id)[0]
+                )
+    # the legacy parallel API reports the same joined element numbering
+    with parallel_exodusii_file(*copies) as f:
+        np.testing.assert_array_equal(f.get_element_id_map(), ids)
+        for ss in joined.side_sets:
+            np.testing.assert_array_equal(f.get_side_set_elems(ss.id), ss.elems + 1)
+
+
+def test_parallel_join_rejects_duplicate_global_ids(datadir, tmp_path):
+    """Two elements claiming one global id give a clear error, not a KeyError."""
+    copies = []
+    for path in sorted(glob.glob(os.path.join(datadir, "mkmesh.par.2.*"))):
+        copy = tmp_path / os.path.basename(path)
+        shutil.copy(path, copy)
+        copies.append(str(copy))
+    with netCDF4.Dataset(copies[1], "a") as ds:
+        ids = np.ma.getdata(ds["elem_num_map"][:]).copy()
+        ids[-1] = ids[-2]
+        ds["elem_num_map"][:] = ids
+    with pytest.raises(ValueError, match="distinct global element ids"):
+        with open_reader(*copies) as r:
+            r.blocks()
 
 
 def test_open_reader_missing_file(tmp_path):
@@ -503,6 +725,58 @@ def test_open_reader_meshio_file(tmp_path):
     with exodusii_file(path) as f:
         np.testing.assert_array_equal(f.get_coords(), points)
         assert f.get_element_block_name(f.get_element_block_ids()[0]) == ""
+
+
+def test_open_reader_meshio_vector_point_data(tmp_path):
+    """meshio stores (n, k) point data as one variable with a component axis;
+    the reader exposes it as k scalar variables named with the standard
+    component suffixes, so every node variable is (n_steps, num_nodes)."""
+    rng = np.random.default_rng(3)
+    points = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=float)
+    point_data = {
+        "T": np.arange(4.0),
+        "vec": rng.random((4, 3)),
+        "uv": rng.random((4, 2)),
+        "sym": rng.random((4, 6)),
+        "four": rng.random((4, 4)),
+        "tensor": rng.random((4, 3, 3)),
+    }
+    mesh = meshio.Mesh(points, [("quad", np.array([[0, 1, 2, 3]]))],
+                       point_data=point_data)
+    path = str(tmp_path / "meshio_vec.exo")
+    meshio.write(path, mesh, file_format="exodus")
+    with netCDF4.Dataset(path) as ds:  # the layout this test is about
+        assert ds["vals_nod_var2"].shape == (1, 4, 3)
+        assert ds["vals_nod_var6"].shape == (1, 4, 3, 3)
+    # meshio itself reads the vector back: the layout is (time, node, component)
+    np.testing.assert_array_equal(
+        meshio.read(path).point_data["vec"], point_data["vec"]
+    )
+
+    expected = {"T": point_data["T"]}
+    for name, values in point_data.items():
+        if values.ndim > 1:
+            flat = values.reshape(4, -1)
+            for k, suffix in enumerate(component_suffixes(flat.shape[1])):
+                expected[name + suffix] = flat[:, k]
+    assert component_suffixes(4) == ("_0", "_1", "_2", "_3")
+    with open_reader(path) as r:
+        assert r.node_var_names() == list(expected)
+        assert r.node_var_names()[1:4] == ["vec_X", "vec_Y", "vec_Z"]
+        for name, values in expected.items():
+            np.testing.assert_array_equal(r.node_var(name, 0), values)
+            history = r.node_var(name)
+            assert history.shape == (1, 4)
+            np.testing.assert_array_equal(history[0], values)
+        with pytest.raises(KeyError):
+            r.node_var("vec")
+    model = read_model(path)
+    write_model(tmp_path / "rt.exo", model)
+    back = read_model(tmp_path / "rt.exo")
+    assert list(back.node_vars) == list(expected)
+    np.testing.assert_array_equal(
+        back.node_vars["tensor_YX"][0], point_data["tensor"][:, 1, 0]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -618,6 +892,22 @@ def test_legacy_time_step_semantics(datadir, datafile, parallel):
                 f.get_element_variable_values(block_id, elem_name, time_step=bad)
             with pytest.raises(IndexError):
                 f.get_global_variable_value(glo_name, bad)
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_legacy_global_variable_value_is_scalar(datadir, datafile, parallel):
+    """A single global value is a numpy scalar (hashable), not a 0-d array."""
+    if parallel:
+        f = parallel_exodusii_file(*glob.glob(os.path.join(datadir, "noh.exo.3.*")))
+    else:
+        f = exodusii_file(datafile("noh.exo"))
+    with f:
+        name = f.get_global_variable_names()[0]
+        value = f.get_global_variable_value(name, -1)
+        assert isinstance(value, np.float64)
+        assert isinstance(value, float)
+        assert {value: 1}[value] == 1
+        assert value == f.get_global_variable_values(name)[-1]
 
 
 # --------------------------------------------------------------------------- #

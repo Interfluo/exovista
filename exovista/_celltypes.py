@@ -28,7 +28,13 @@ file has ``num_dim == 2`` and to shell types (``TRISHELL*``/``SHELL4``/
 in both cases: VTK's ExodusII reader (<= 9.7) reads ``SHELL9`` blocks with an
 8-node stride, corrupting every element after the first. ``SHELL9`` is still
 accepted on read. Like the Exodus library, a ``TRI`` element in a 3D file has
-shell-like sides (two faces then three edges).
+shell-like sides (two faces then three edges) and a ``TRISHELL`` element in a
+2D file is a plain triangle (three edge sides).
+
+Element-type names are recognised, as by the Exodus library and VTK's reader,
+by their first three letters (``HEXA8`` is a ``HEX8``, ``TRIA3`` a ``TRI3``,
+``EDGE2`` -- the libMesh/MOOSE name -- a ``BAR2``); the node count stored in
+the file decides the element order.
 """
 
 from __future__ import annotations
@@ -241,28 +247,43 @@ EXO_TYPES: dict[str, ExoType] = {
     )
 }
 
-# Exodus name prefixes accepted on read -> topology family.
-_FAMILY_ALIASES: dict[str, str] = {
-    "SPHERE": "SPHERE",
-    "CIRCLE": "SPHERE",
+# Exodus element-type names accepted on read -> topology family. Like the
+# Exodus library (``ex_int_get_block_param``) and VTK's ExodusII reader, a
+# family is recognised by the first three letters of the name: ``HEXA8``,
+# ``TRIA3``, ``TETRAHEDRON``, ``SHELL`` and ``EDGE2`` (libMesh / MOOSE 1D
+# elements) all resolve. The Exodus library has no other ``TRI``/``TRISHELL``
+# distinction than the file's num_dim (see :func:`resolve_exo_type`).
+_FAMILY_PREFIXES: dict[str, str] = {
+    "SPH": "SPHERE",
+    "CIR": "SPHERE",
     "BAR": "BAR",
-    "TRUSS": "BAR",
-    "BEAM": "BEAM",
+    "TRU": "BAR",
+    "EDG": "BAR",
+    "BEA": "BEAM",
     "TRI": "TRI",
-    "TRIANGLE": "TRI",
-    "TRISHELL": "TRISHELL",
-    "QUAD": "QUAD",
-    "QUADRILATERAL": "QUAD",
-    "SHELL": "SHELL",
+    "QUA": "QUAD",
+    "SHE": "SHELL",
     "TET": "TETRA",
-    "TETRA": "TETRA",
-    "TETRAHEDRON": "TETRA",
     "HEX": "HEX",
-    "HEXAHEDRON": "HEX",
-    "WEDGE": "WEDGE",
-    "PYRAMID": "PYRAMID",
-    "PYRA": "PYRAMID",
+    "WED": "WEDGE",
+    "PYR": "PYRAMID",
 }
+# Full names that the three-letter rule would misclassify or not know.
+# ``TRISHELL`` keeps its shell sides when num_dim is unknown; VTK reads
+# ``STRAIGHT`` (but not ``STR``) as a line.
+_FAMILY_NAMES: dict[str, str] = {
+    "TRISHELL": "TRISHELL",
+    "STRAIGHT": "BAR",
+}
+
+
+def _family(prefix: str) -> str | None:
+    """Topology family of the alphabetic part of an element-type name."""
+    family = _FAMILY_NAMES.get(prefix)
+    if family is None and len(prefix) >= 3:
+        family = _FAMILY_PREFIXES.get(prefix[:3])
+    return family
+
 
 # family -> {n_nodes: ExoType}
 _BY_FAMILY: dict[str, dict[int, ExoType]] = {}
@@ -384,16 +405,19 @@ def resolve_exo_type(
     ----------
     exo_name : str
         Element type as stored in the file (``elem_type`` attribute). The match
-        is case-insensitive and ignores surrounding whitespace. Any alias in
-        the family (``HEX``, ``HEX8``, ``HEXAHEDRON``, ``BEAM2``, ...) works.
+        is case-insensitive and ignores surrounding whitespace. As in the
+        Exodus library and VTK, the family is decided by the first three
+        letters, so any alias works (``HEX``, ``HEX8``, ``HEXA8``,
+        ``HEXAHEDRON``, ``TRIA3``, ``EDGE2``, ``BEAM2``, ...); ``STRAIGHT`` is
+        a ``BAR``.
     n_nodes : int, optional
         Nodes per element in the block. As in Exodus, it decides the element
         order (``HEX`` with 20 nodes is ``HEX20``). Defaults to the number in
         the name, else the linear element.
     num_dim : int, optional
-        Spatial dimension of the file. A ``TRI`` element in a 3D file is
-        treated as a ``TRISHELL`` (shell-like sides), as the Exodus library
-        does.
+        Spatial dimension of the file. As in the Exodus library, a ``TRI``
+        element in a 3D file is treated as a ``TRISHELL`` (shell-like sides)
+        and a ``TRISHELL`` element in a 2D file as a ``TRI`` (three edges).
 
     Returns
     -------
@@ -405,11 +429,14 @@ def resolve_exo_type(
     if match is None:
         return None
     prefix, digits = match.groups()
-    family = _FAMILY_ALIASES.get(prefix)
+    family = _family(prefix)
     if family is None:
         return None
-    if family == "TRI" and num_dim is not None and int(num_dim) == 3:
-        family = "TRISHELL"
+    if num_dim is not None:
+        if family == "TRI" and int(num_dim) == 3:
+            family = "TRISHELL"
+        elif family == "TRISHELL" and int(num_dim) == 2:
+            family = "TRI"
     by_nodes = _BY_FAMILY[family]
     if n_nodes is None:
         n_nodes = int(digits) if digits else min(by_nodes)

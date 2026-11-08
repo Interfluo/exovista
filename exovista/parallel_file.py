@@ -473,7 +473,10 @@ class parallel_exodusii_file(exodusii_file):
         elem_id_map : ndarray of int
 
         """
-        map = None if file is None else self.get_variable(file, ex.VAR_ELEM_NUM_MAP)
+        if file is None:
+            # ids of the joined elements: blocks in order, ids sorted per block
+            return self.joined_elem_ids()
+        map = self.get_variable(file, ex.VAR_ELEM_NUM_MAP)
         if map is None:
             map = np.arange(self.num_elems(), dtype=int) + 1
         return map
@@ -548,9 +551,7 @@ class parallel_exodusii_file(exodusii_file):
             shape = (self.num_elems_in_blk(block_id),)
         values = np.zeros(shape, dtype=float)
 
-        map1 = self.get_mapping(
-            ex.maps.elem_block_elem_local_to_global, contiguous=True
-        )
+        map1 = self.get_mapping(ex.maps.elem_block_elem_local_to_global)
         map2 = self.get_mapping(ex.maps.elem_block_elem_global_to_local)
         active = found = 0
         for (fid, file) in enumerate(self.files):
@@ -973,8 +974,11 @@ class parallel_exodusii_file(exodusii_file):
         num_sides = self.num_sides_in_side_set(set_id)
         elems, sides = np.zeros(num_sides, dtype=int), np.zeros(num_sides, dtype=int)
 
+        # Elements are reported as 1-based indices into the joined element
+        # order (see joined_elem_ids), like a serial file's element indices.
         side = 0
         lid_to_gid = self.get_mapping(ex.maps.elem_local_to_global)
+        gid_to_index = self._joined_elem_index()
         for (fid, file) in enumerate(self.files):
             set_iid = self.get_side_set_iid(file, set_id)
             if not self.side_set_is_active(file, set_iid):
@@ -982,7 +986,7 @@ class parallel_exodusii_file(exodusii_file):
             file_local_ss_elems = self.get_variable(file, ex.VAR_ELEM_SIDE_SET(set_iid))
             file_local_ss_sides = self.get_variable(file, ex.VAR_SIDE_SIDE_SET(set_iid))
             for (i, local_elem) in enumerate(file_local_ss_elems):
-                elems[side] = lid_to_gid[(fid, local_elem)]
+                elems[side] = gid_to_index[int(lid_to_gid[(fid, local_elem)])]
                 sides[side] = file_local_ss_sides[i]
                 side += 1
 
@@ -1541,16 +1545,63 @@ class parallel_exodusii_file(exodusii_file):
                 start = end
         return mapping
 
-    def elem_blk_elem_g2l(self):
-        num_elems = self.num_elems()
+    def _joined_block_gids(self):
+        """Return {element block ID: sorted global element IDs of the block}.
+
+        The joined element order lists the blocks in order and, within a
+        block, its elements by increasing global id. Global ids need not be
+        contiguous per block (or at all), e.g. after adaptive refinement.
+        """
+        if "joined_block_gids" in self.cache:
+            return self.cache["joined_block_gids"]
+        found = {}
+        l2g = self.get_mapping(ex.maps.elem_block_elem_local_to_global)
+        for (fid, block_id, iid), gid in l2g.items():
+            found.setdefault(int(block_id), set()).add(int(gid))
         counts = self.num_elems_in_all_blks()
-        assert sum(counts) == num_elems
-        el = 1
-        mapping = {}
+        gids = {}
         for (i, block_id) in enumerate(self.get_element_block_ids()):
-            for j in range(counts[i]):
-                mapping[(block_id, el)] = j + 1
-                el += 1
+            block_gids = sorted(found.get(int(block_id), ()))
+            if counts is not None and len(block_gids) != int(counts[i]):
+                raise ValueError(
+                    f"Element block {block_id}: the decomposition has "
+                    f"{len(block_gids)} distinct global element ids, but the "
+                    f"global block size is {int(counts[i])}"
+                )
+            gids[int(block_id)] = block_gids
+        all_gids = [gid for block_gids in gids.values() for gid in block_gids]
+        if len(set(all_gids)) != len(all_gids):
+            raise ValueError(
+                "The decomposition uses the same global element id in more "
+                "than one element block"
+            )
+        self.cache["joined_block_gids"] = gids
+        return gids
+
+    def joined_elem_ids(self):
+        """Global element ids in the joined element order (see
+        :meth:`_joined_block_gids`); entry ``i`` is the id of joined element
+        ``i + 1``."""
+        gids = self._joined_block_gids()
+        ids = [gid for block_id in gids for gid in gids[block_id]]
+        return np.array(ids, dtype=int)
+
+    def _joined_elem_index(self):
+        """Return {global element ID: 1-based index in the joined order}."""
+        if "joined_elem_index" not in self.cache:
+            ids = self.joined_elem_ids()
+            self.cache["joined_elem_index"] = {
+                int(gid): i for (i, gid) in enumerate(ids, start=1)
+            }
+        return self.cache["joined_elem_index"]
+
+    def elem_blk_elem_g2l(self):
+        """Return mapping from (element block ID, global element ID) to the
+        1-based index of the element within the joined block."""
+        mapping = {}
+        for (block_id, block_gids) in self._joined_block_gids().items():
+            for (j, gid) in enumerate(block_gids, start=1):
+                mapping[(block_id, gid)] = j
         return mapping
 
     def edge_blk_edge_l2g(self):
@@ -1630,7 +1681,7 @@ class parallel_exodusii_file(exodusii_file):
         """Return mapping from file local element ID to global element ID"""
         mapping = {}
         for (fid, file) in enumerate(self.files):
-            file_local_map = self.get_variable(file, ex.VAR_ELEM_NUM_MAP)
+            file_local_map = self.f_get_element_id_map(file)
             for (lid, gid) in enumerate(file_local_map, start=1):
                 mapping[(fid, lid)] = gid
         return mapping

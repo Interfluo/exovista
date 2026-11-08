@@ -21,6 +21,15 @@ from exovista._model import Block, ExodusModel, SideSet
 
 VTK = ct.VTK
 
+# VTK's axis-aligned cells use a different corner order than the native cell
+# they are written as (VTK_PIXEL -> QUAD4/SHELL4, VTK_VOXEL -> HEX8): the
+# native connectivity is ``conn[:, order]``. Spelled out independently of
+# ``_celltypes`` so the permutation under test is never its own oracle.
+_AXIS_ALIGNED_TO_NATIVE = {
+    VTK.PIXEL: [0, 1, 3, 2],
+    VTK.VOXEL: [0, 1, 3, 2, 4, 5, 7, 6],
+}
+
 # VTK type -> pyvista example-cell constructor providing a valid geometry
 _EXAMPLES = {
     VTK.VERTEX: "Vertex",
@@ -105,9 +114,11 @@ def test_permutation_matches_vtk_reader(tmp_path, vtk_type, num_dim):
     path = tmp_path / "cells.exo"
     write_model(path, model)
 
-    # VOXEL/PIXEL are written as HEX8/QUAD4: expect the native VTK order.
-    native = conn[:, ct.vtk_to_exo_perm(vtk_type)] if vtk_type in (
-        VTK.PIXEL, VTK.VOXEL
+    # VOXEL/PIXEL are written as HEX8/QUAD4 (SHELL4) and read back in their
+    # native VTK order. The expected order is spelled out here, independently
+    # of the permutation under test.
+    native = conn[:, _AXIS_ALIGNED_TO_NATIVE[vtk_type]] if vtk_type in (
+        _AXIS_ALIGNED_TO_NATIVE
     ) else conn
 
     grid = _oracle_grid(path)
@@ -115,6 +126,13 @@ def test_permutation_matches_vtk_reader(tmp_path, vtk_type, num_dim):
     assert list(grid.celltypes) == [info.vtk_type] * 2
     for i in range(2):
         np.testing.assert_array_equal(_cell_points(grid, i), points[native[i]])
+    # Geometric check: what VTK reads back has the size of the input cells.
+    size = "Volume" if info.dim == 3 else "Area" if info.dim == 2 else None
+    if size is not None and (info.dim == 3 or num_dim == 2):
+        source = pv.UnstructuredGrid({vtk_type: conn}, points)
+        expected = source.compute_cell_sizes()[size]
+        assert np.all(expected > 0)
+        np.testing.assert_allclose(grid.compute_cell_sizes()[size], expected)
 
     # and back through exovista's own reader
     with open_reader(path) as reader:
@@ -144,6 +162,19 @@ def test_permutation_matches_vtk_reader(tmp_path, vtk_type, num_dim):
         ("HEXAHEDRON", VTK.TRIQUADRATIC_HEXAHEDRON, 3),
         ("WEDGE", VTK.QUADRATIC_WEDGE, 3),
         ("PYRA", VTK.QUADRATIC_PYRAMID, 3),
+        # libMesh / MOOSE 1D elements, and names matched by 3 letters
+        ("EDGE2", VTK.LINE, 3),
+        ("EDGE3", VTK.QUADRATIC_EDGE, 2),
+        ("STRAIGHT2", VTK.LINE, 3),
+        ("TRIA3", VTK.TRIANGLE, 2),
+        ("TRIA6", VTK.QUADRATIC_TRIANGLE, 3),
+        ("HEXA8", VTK.HEXAHEDRON, 3),
+        ("HEXA", VTK.QUADRATIC_HEXAHEDRON, 3),
+        ("QUADRANGLE", VTK.QUAD, 2),
+        ("TETRAHEDRAL", VTK.TETRA, 3),
+        ("PYRAMIDAL", VTK.PYRAMID, 3),
+        ("SPHERICAL", VTK.VERTEX, 3),
+        ("TRISHELL3", VTK.TRIANGLE, 2),
     ],
 )
 def test_read_aliases_match_vtk_reader(tmp_path, exo_name, vtk_type, num_dim):
@@ -186,9 +217,11 @@ def _side_cases():
             continue
         num_dim = 2 if info.family in ("TRI", "QUAD") else 3
         cases.append((info.name, num_dim))
-    # Like the Exodus library, a TRI element in a 3D file has shell sides.
-    cases.append(("TRI3", 3))
-    cases.append(("TRI6", 3))
+    # Like the Exodus library, a TRI element in a 3D file has shell sides and
+    # a TRISHELL element in a 2D file has the three edges of a TRI.
+    cases += [("TRI3", 3), ("TRI6", 3), ("TRISHELL3", 2), ("TRISHELL6", 2)]
+    # libMesh / MOOSE name for BAR elements
+    cases += [("EDGE2", 3), ("EDGE3", 2)]
     return cases
 
 
@@ -247,8 +280,10 @@ def test_conn_roundtrip(vtk_type):
     conn = conn.reshape(3, info.n_nodes)
     exo = ct.to_exodus_conn(vtk_type, conn)
     back = ct.to_vtk_conn(info.name, exo)
-    if vtk_type in (VTK.PIXEL, VTK.VOXEL):
-        np.testing.assert_array_equal(back, conn[:, ct.vtk_to_exo_perm(vtk_type)])
+    if vtk_type in _AXIS_ALIGNED_TO_NATIVE:
+        np.testing.assert_array_equal(
+            back, conn[:, _AXIS_ALIGNED_TO_NATIVE[vtk_type]]
+        )
     else:
         np.testing.assert_array_equal(back, conn)
     native = ct.vtk_type_for(info.name)
@@ -330,6 +365,19 @@ def test_3d_cells_rejected_in_2d_files():
         ("BEAM2", None, None, "BEAM2"),
         ("SPHERE", 1, None, "SPHERE"),
         ("CIRCLE", None, None, "SPHERE"),
+        # first three letters decide, as in the Exodus library and VTK
+        ("EDGE2", None, None, "BAR2"),
+        ("edge", 3, 3, "BAR3"),
+        ("STRAIGHT2", None, None, "BAR2"),
+        ("TRIA3", None, 2, "TRI3"),
+        ("HEXA", 20, None, "HEX20"),
+        ("SHE", 8, None, "SHELL8"),
+        ("PYRAMIDAL", 13, None, "PYRAMID13"),
+        # TRI <-> TRISHELL follows num_dim
+        ("TRISHELL3", 3, 2, "TRI3"),
+        ("TRISHELL", 6, 2, "TRI6"),
+        ("TRISHELL3", None, 3, "TRISHELL3"),
+        ("TRIA", 6, 3, "TRISHELL6"),
     ],
 )
 def test_resolve_aliases(name, n_nodes, num_dim, expected):
@@ -337,7 +385,18 @@ def test_resolve_aliases(name, n_nodes, num_dim, expected):
 
 
 @pytest.mark.parametrize(
-    "name,n_nodes", [("FOO", None), ("HEX", 7), ("TETRA", 11), ("NULL", 0), ("", None)]
+    "name,n_nodes",
+    [
+        ("FOO", None),
+        ("HEX", 7),
+        ("TETRA", 11),
+        ("NULL", 0),
+        ("", None),
+        ("TR", None),
+        ("STR2", None),  # VTK only knows the full word STRAIGHT
+        ("PENTA6", None),
+        ("HEX8_2", None),
+    ],
 )
 def test_resolve_unknown(name, n_nodes):
     assert ct.resolve_exo_type(name, n_nodes) is None
@@ -351,8 +410,25 @@ def test_helpers():
     assert ct.n_corners("TETRA", 10) == 4
     assert ct.side_corner_nodes("HEX8")[0] == (0, 1, 5, 4)
     assert ct.side_corner_nodes("TRI3", num_dim=3)[1] == (2, 1, 0)
+    assert ct.side_corner_nodes("TRISHELL3", num_dim=2) == [(0, 1), (1, 2), (2, 0)]
     vtk_type, perm = ct.vtk_type_for("HEX20")
     assert vtk_type == VTK.QUADRATIC_HEXAHEDRON
     assert list(perm[12:]) == [16, 17, 18, 19, 12, 13, 14, 15]
     with pytest.raises(ValueError, match="shape"):
         ct.to_exodus_conn(VTK.HEXAHEDRON, np.zeros((2, 4), int))
+
+
+def test_trishell_in_2d_file_has_tri_sides(tmp_path):
+    """Like the Exodus library, a TRISHELL block in a 2D file is a TRI."""
+    coords = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    blocks = [Block(1, "b", "TRISHELL3", [[0, 1, 2]])]
+    ok = ExodusModel("ok", 2, coords, blocks, side_sets=[SideSet(1, "s", [0], [3])])
+    ok.validate()
+    bad = ExodusModel("bad", 2, coords, blocks, side_sets=[SideSet(1, "s", [0], [4])])
+    with pytest.raises(ValueError, match="3 sides"):
+        write_model(tmp_path / "bad.exo", bad)
+    # in a 3D file the same element keeps its 2 faces + 3 edges
+    coords3 = np.c_[coords, [0.0, 0.0, 0.5]]
+    ExodusModel(
+        "ok3", 3, coords3, blocks, side_sets=[SideSet(1, "s", [0], [5])]
+    ).validate()

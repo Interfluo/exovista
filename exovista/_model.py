@@ -23,10 +23,45 @@ import numpy as np
 
 from ._celltypes import resolve_exo_type
 
-__all__ = ["Block", "SideSet", "NodeSet", "ExodusModel", "MAX_NAME_LENGTH"]
+__all__ = [
+    "Block",
+    "SideSet",
+    "NodeSet",
+    "ExodusModel",
+    "MAX_NAME_LENGTH",
+    "component_suffixes",
+]
 
-#: Longest entity / variable name an Exodus file can store (``len_name``).
+#: Longest entity / variable name an Exodus file can store (``len_name``), in
+#: bytes of its UTF-8 encoding.
 MAX_NAME_LENGTH = 256
+
+# Ids and the element id map are stored as 32-bit integers.
+_INT32_MIN = int(np.iinfo(np.int32).min)
+_INT32_MAX = int(np.iinfo(np.int32).max)
+
+# Variable-name suffixes of the components of a multi-component array, by
+# number of components (6: VTK symmetric tensor order; 9: row-major tensor).
+_COMPONENT_SUFFIXES: dict[int, tuple[str, ...]] = {
+    2: ("_X", "_Y"),
+    3: ("_X", "_Y", "_Z"),
+    6: ("_XX", "_YY", "_ZZ", "_XY", "_YZ", "_XZ"),
+    9: ("_XX", "_XY", "_XZ", "_YX", "_YY", "_YZ", "_ZX", "_ZY", "_ZZ"),
+}
+
+
+def component_suffixes(n_components: int) -> tuple[str, ...]:
+    """Suffixes naming the scalar Exodus variables of an ``n``-component array.
+
+    2 -> ``_X, _Y``; 3 -> ``_X, _Y, _Z``; 6 (VTK symmetric tensor order) ->
+    ``_XX, _YY, _ZZ, _XY, _YZ, _XZ``; 9 (row-major) -> ``_XX, _XY, ... _ZZ``;
+    any other ``n`` -> ``_0 ... _{n-1}``. This is the one convention used to
+    split arrays into Exodus variables and to recombine them.
+    """
+    n = int(n_components)
+    if n < 1:
+        raise ValueError(f"n_components must be >= 1, got {n_components!r}")
+    return _COMPONENT_SUFFIXES.get(n, tuple(f"_{i}" for i in range(n)))
 
 
 def _int_array(values, ndim: int, what: str) -> np.ndarray:
@@ -45,14 +80,51 @@ def _int_array(values, ndim: int, what: str) -> np.ndarray:
     return arr.astype(np.int64, copy=False)
 
 
+def _normalize_name(name) -> str:
+    """Entity / variable name as stored: trailing whitespace removed.
+
+    Exodus names are blank padded and every reader (the Exodus library, VTK,
+    exovista) strips trailing whitespace, so it cannot survive a round trip.
+    """
+    return str(name).rstrip()
+
+
 def _check_name(name: str, what: str) -> str:
-    name = str(name)
-    if len(name) > MAX_NAME_LENGTH:
+    """Normalize ``name`` and check that Exodus can store it."""
+    name = _normalize_name(name)
+    if "\0" in name:
+        raise ValueError(f"{what} name {name!r} contains a NUL character")
+    n_bytes = len(name.encode("utf-8"))
+    if n_bytes > MAX_NAME_LENGTH:
         raise ValueError(
-            f"{what} name {name[:40]!r}... has {len(name)} characters; Exodus "
-            f"allows at most {MAX_NAME_LENGTH}"
+            f"{what} name {name[:40]!r}... is {n_bytes} bytes long (UTF-8); "
+            f"Exodus allows at most {MAX_NAME_LENGTH}"
         )
     return name
+
+
+def _normalized_keys(mapping: dict, what: str) -> dict:
+    """``mapping`` with normalized variable names; reject names that collide."""
+    out: dict = {}
+    original: dict[str, object] = {}
+    for key, value in mapping.items():
+        name = _normalize_name(key)
+        if name in out:
+            raise ValueError(
+                f"{what} variable names {original[name]!r} and {key!r} are the "
+                "same once trailing whitespace is removed (Exodus strips it)"
+            )
+        out[name] = value
+        original[name] = key
+    return out
+
+
+def _check_id(value: int, what: str) -> None:
+    if not _INT32_MIN <= value <= _INT32_MAX:
+        raise ValueError(
+            f"{what} id {value} does not fit in a 32-bit integer "
+            f"({_INT32_MIN}..{_INT32_MAX})"
+        )
 
 
 @dataclass(frozen=True)
@@ -62,9 +134,10 @@ class Block:
     Attributes
     ----------
     id : int
-        Exodus block id (any integer; usually >= 1).
+        Exodus block id (any 32-bit integer; usually >= 1).
     name : str
-        Block name ("" for unnamed blocks).
+        Block name ("" for unnamed blocks). Trailing whitespace is removed;
+        at most 256 bytes (UTF-8).
     elem_type : str
         Exodus element type, e.g. ``"HEX8"`` (as stored in the file on read).
     conn : ndarray of int, shape (n_elem, n_nodes_per_elem)
@@ -184,10 +257,14 @@ class ExodusModel:
         Sets in file order.
     elem_id_map : ndarray of int, shape (n_elem,), optional
         1-based element ids in file order (Exodus ``elem_num_map``), or None.
+        Ids are unique and stored as 32-bit integers (1 .. 2**31 - 1), like
+        the block, side-set and node-set ids.
     times : ndarray of float64, shape (n_steps,)
         Time value of each step (may be empty when there are no variables).
     node_vars : dict of str to ndarray, shape (n_steps, n_nodes)
-        Nodal variables.
+        Nodal variables. In all variable dicts, trailing whitespace is removed
+        from the names (Exodus readers strip it); names that then collide
+        raise ``ValueError``.
     elem_vars : dict of str to dict of int to ndarray, shape (n_steps, n_blk)
         Element variables keyed by name, then by block id. A block missing
         from the inner dict has no values for that variable (truth table 0).
@@ -233,24 +310,24 @@ class ExodusModel:
             self,
             "node_vars",
             {
-                str(k): np.asarray(v, dtype=np.float64)
-                for k, v in self.node_vars.items()
+                k: np.asarray(v, dtype=np.float64)
+                for k, v in _normalized_keys(self.node_vars, "node").items()
             },
         )
         object.__setattr__(
             self,
             "elem_vars",
             {
-                str(k): {int(b): np.asarray(a, dtype=np.float64) for b, a in v.items()}
-                for k, v in self.elem_vars.items()
+                k: {int(b): np.asarray(a, dtype=np.float64) for b, a in v.items()}
+                for k, v in _normalized_keys(self.elem_vars, "element").items()
             },
         )
         object.__setattr__(
             self,
             "global_vars",
             {
-                str(k): np.asarray(v, dtype=np.float64).reshape(-1)
-                for k, v in self.global_vars.items()
+                k: np.asarray(v, dtype=np.float64).reshape(-1)
+                for k, v in _normalized_keys(self.global_vars, "global").items()
             },
         )
 
@@ -297,9 +374,15 @@ class ExodusModel:
             raise ValueError("coords contain NaN or infinite values")
         n_nodes = self.num_nodes
 
-        _check_unique([b.id for b in self.blocks], "element block")
-        _check_unique([s.id for s in self.side_sets], "side set")
-        _check_unique([s.id for s in self.node_sets], "node set")
+        for entities, what in (
+            (self.blocks, "element block"),
+            (self.side_sets, "side set"),
+            (self.node_sets, "node set"),
+        ):
+            ids = [e.id for e in entities]
+            _check_unique(ids, what)
+            for i in ids:
+                _check_id(i, what)
 
         for block in self.blocks:
             if not block.elem_type:
@@ -355,11 +438,20 @@ class ExodusModel:
                     f"Node set {ns.id} references nodes outside 0..{n_nodes - 1}"
                 )
 
-        if self.elem_id_map is not None and self.elem_id_map.shape != (num_elem,):
-            raise ValueError(
-                f"elem_id_map has length {self.elem_id_map.shape[0]}, expected "
-                f"num_elem={num_elem}"
-            )
+        if self.elem_id_map is not None:
+            id_map = self.elem_id_map
+            if id_map.shape != (num_elem,):
+                raise ValueError(
+                    f"elem_id_map has length {id_map.shape[0]}, expected "
+                    f"num_elem={num_elem}"
+                )
+            if id_map.size and (id_map.min() < 1 or id_map.max() > _INT32_MAX):
+                raise ValueError(
+                    f"elem_id_map values must be in 1..{_INT32_MAX} (32-bit "
+                    f"element ids), got {id_map.min()}..{id_map.max()}"
+                )
+            if np.unique(id_map).size != id_map.size:
+                raise ValueError("elem_id_map contains duplicate element ids")
 
         n_steps = self.n_steps
         if self.has_variables() and n_steps == 0:

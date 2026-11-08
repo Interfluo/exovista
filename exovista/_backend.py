@@ -24,7 +24,7 @@ from typing import Iterator
 import numpy as np
 
 from . import exodus_h as ex
-from ._model import Block, ExodusModel, NodeSet, SideSet
+from ._model import Block, ExodusModel, NodeSet, SideSet, component_suffixes
 from .file import exodusii_file
 from .parallel_file import parallel_exodusii_file
 
@@ -207,9 +207,10 @@ def _chars_to_str(chars) -> str:
 
 
 def _str_list(names) -> list[str]:
+    # Like the Exodus library, only trailing blanks are insignificant.
     if names is None:
         return []
-    return [str(n).strip() for n in np.atleast_1d(names)]
+    return [str(n).rstrip() for n in np.atleast_1d(names)]
 
 
 class ExodusReader:
@@ -220,6 +221,13 @@ class ExodusReader:
     0-based time-step indices (the 1-based / negative ``time_step`` semantics
     of the public API live in :mod:`exovista.read_pyvista`); a single step is
     read by slicing the netCDF variable, never by loading the whole history.
+
+    Names keep leading whitespace and lose trailing whitespace, as with the
+    Exodus library. Every variable is a scalar series: a nodal variable
+    stored with extra component axes (meshio writes vector point data as
+    ``vals_nod_varN`` with shape ``(time_step, num_nodes, n)``) is exposed as
+    ``n`` scalar variables named with
+    :func:`~exovista._model.component_suffixes` (``vec_X``, ``vec_Y``, ...).
     """
 
     def __init__(self, handle: exodusii_file):
@@ -227,6 +235,7 @@ class ExodusReader:
         self._parallel = isinstance(handle, parallel_exodusii_file)
         self._times: np.ndarray | None = None
         self._cache: dict[str, list] = {}
+        self._node_vars: dict[str, tuple[str, int | None, int]] | None = None
 
     # -- metadata --------------------------------------------------------- #
     @property
@@ -293,7 +302,7 @@ class ExodusReader:
         f = self._f
         out = []
         for block_id in self._block_ids():
-            name = str(f.get_element_block_name(block_id) or "").strip()
+            name = str(f.get_element_block_name(block_id) or "").rstrip()
             info = f.get_element_block(block_id)
             if info is None or not info.num_block_elems:
                 elem_type = "NULL" if info is None else str(info.elem_type)
@@ -327,11 +336,11 @@ class ExodusReader:
         """1-based element ids in file order (``elem_num_map``), or None.
 
         None means the file stores no map (ids are 1..num_elem). For a
-        parallel decomposition the joined element order already is the
-        global id order, so None is returned as well.
+        parallel decomposition these are the global element ids in the joined
+        order (blocks in order, ids increasing within each block).
         """
         if self._parallel:
-            return None
+            return np.asarray(self._f.get_element_id_map(), dtype=np.int64)
         values = self._f.get_variable(ex.VAR_ELEM_NUM_MAP)
         if values is None:
             return None
@@ -344,7 +353,7 @@ class ExodusReader:
         out = []
         for set_id in [] if ids is None else np.atleast_1d(ids):
             set_id = int(set_id)
-            name = str(f.get_side_set_name(set_id) or "").strip()
+            name = str(f.get_side_set_name(set_id) or "").rstrip()
             elems = f.get_side_set_elems(set_id)
             sides = f.get_side_set_sides(set_id)
             if elems is None or sides is None:
@@ -367,7 +376,7 @@ class ExodusReader:
         out = []
         for set_id in [] if ids is None else np.atleast_1d(ids):
             set_id = int(set_id)
-            name = str(f.get_node_set_name(set_id) or "").strip()
+            name = str(f.get_node_set_name(set_id) or "").rstrip()
             nodes = f.get_node_set_nodes(set_id)
             if nodes is None:
                 nodes = np.zeros(0, dtype=np.int64)
@@ -386,11 +395,51 @@ class ExodusReader:
             self._times = np.asarray(times, dtype=np.float64).reshape(-1)
         return self._times.copy()
 
+    def _node_variables(self) -> dict[str, tuple[str, int | None, int]]:
+        """Nodal variable name -> (stored name, component or None, n_comp)."""
+        if self._node_vars is None:
+            stored = _str_list(self._f.get_node_variable_names())
+            n_comps = [self._node_var_components(i) for i in range(1, len(stored) + 1)]
+            taken = {name for name, n in zip(stored, n_comps) if n is None}
+            mapping: dict[str, tuple[str, int | None, int]] = {}
+            for name, n in zip(stored, n_comps):
+                if n is None:
+                    mapping.setdefault(name, (name, None, 1))
+                    continue
+                if n == 0:
+                    continue  # an empty component axis holds no values
+                if n == 1:
+                    names = [name]
+                else:
+                    names = [name + suffix for suffix in component_suffixes(n)]
+                    if taken.intersection(names) or len(set(names)) != n:
+                        names = [f"{name}_{k}" for k in range(n)]
+                if taken.intersection(names):
+                    raise ValueError(
+                        f"cannot name the {n} components of nodal variable "
+                        f"{name!r}: {sorted(taken.intersection(names))} exist"
+                    )
+                taken.update(names)
+                for k, component in enumerate(names):
+                    mapping[component] = (name, k, n)
+            self._node_vars = mapping
+        return self._node_vars
+
+    def _node_var_components(self, iid: int) -> int | None:
+        """Components of a node variable stored with extra trailing axes.
+
+        None for a standard ``(time_step, num_nodes)`` variable.
+        """
+        if self._parallel:
+            return None
+        var = self._f.get_variable(ex.VAR_NODE_VAR(iid), raw=True)
+        if var is None or len(var.shape) <= 2:
+            return None
+        return int(np.prod(var.shape[2:]))
+
     def node_var_names(self) -> list[str]:
-        """Names of the nodal variables."""
-        return self._cached(
-            "node", lambda: _str_list(self._f.get_node_variable_names())
-        )
+        """Names of the nodal variables (one per component, see class doc)."""
+        return list(self._node_variables())
 
     def elem_var_names(self) -> list[str]:
         """Names of the element variables."""
@@ -426,9 +475,15 @@ class ExodusReader:
         ``(num_nodes,)`` values at 0-based ``step``. Always float64.
         """
         self._check_name(name, self.node_var_names(), "node")
+        stored, component, n_comp = self._node_variables()[name]
         time_step = self._time_step(step)
-        values = self._f.get_node_variable_values(name, time_step=time_step)
-        return np.asarray(values, dtype=np.float64)
+        values = self._f.get_node_variable_values(stored, time_step=time_step)
+        values = np.asarray(values, dtype=np.float64)
+        if component is not None:
+            lead = 1 if step is not None else 2
+            values = values.reshape(values.shape[:lead] + (n_comp,))
+            values = np.ascontiguousarray(values[..., component])
+        return values
 
     def elem_var(
         self, name: str, block_id: int, step: int | None = None
